@@ -595,6 +595,9 @@ class DataProcessor:
 
 if __name__ == '__main__':
     dp = DataProcessor()
+    dp.prepare_datasets()
+    # import torch
+
     dl = dp.get_dataloader('val', train=False)
     for i, sample in enumerate(dl):
         print(sample[0]['encoder_cont'][0, 0])

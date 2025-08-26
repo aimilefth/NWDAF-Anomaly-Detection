@@ -1,0 +1,14 @@
+# docker-compose.gpu.yml
+version: "3.9"
+
+services:
+  app:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # Read the device ID from an environment variable passed by the run script.
+              # If the variable is not set, it defaults to 'all'.
+              device_ids: ['${NVIDIA_VISIBLE_DEVICES:-all}']
+              capabilities: [gpu]
