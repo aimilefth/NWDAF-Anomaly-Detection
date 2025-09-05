@@ -45,3 +45,30 @@ services:
     ulimits:
       memlock: -1
       stack: 67108864
+
+  app-fpga:
+    image: aimilefth/privateer-ad:app-fpga
+    pull_policy: always
+    # # Use this if wanting to build
+    # build:
+    #   context: ./docker/app-fpga
+    network_mode: host
+    container_name: privateer-ad-app-fpga
+    privileged: true                 # mirrors --privileged in docker_run.sh
+    volumes:
+      - /dev/shm:/dev/shm
+      - /opt/xilinx/dsa:/opt/xilinx/dsa
+      - /opt/xilinx/overlaybins:/opt/xilinx/overlaybins
+      - /etc/xbutler:/etc/xbutler
+      - /scrape:/scrape
+      - .:/app
+    # ports:
+    #   - "8080:8080"                 # (ignored with host networking; keep commented for clarity)
+    depends_on:
+      - mlflow
+    env_file:
+      - .env
+    shm_size: "8gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864

@@ -166,3 +166,5 @@ data/*
 data/raw/*.csv
 data/processed/*.csv
 
+__marimo__
+*.xclbin
