@@ -32,16 +32,35 @@ from privateer_ad.old_data_utils.utils import (
     check_existing_datasets_old,
 )
 
+from .old_metadata import OldMetaData
 
 class OldDataProcessor:
-    """Old pipeline entry point (paths/metadata from new config)."""
+    def __init__(self, use_old_metadata: bool = True, recompute_attack_from_metadata: bool | None = None):
+        """
+        use_old_metadata:
+          - True  -> OldMetaData from old metadata.yaml (legacy behavior)
+          - False -> new MetadataConfig (refactor behavior)
 
-    def __init__(self):
+        recompute_attack_from_metadata:
+          - None -> auto (True for old metadata, False for new metadata)
+          - True/False -> manual override
+        """
         self.paths = PathConfig()
-        self.metadata = MetadataConfig()
+
+        # pick metadata source
+        self.use_old_metadata = bool(use_old_metadata)
+        self.metadata = OldMetaData() if self.use_old_metadata else MetadataConfig()
+
+        # default the recompute flag intelligently
+        self.recompute_attack = (
+            True if (recompute_attack_from_metadata is None and self.use_old_metadata)
+            else False if (recompute_attack_from_metadata is None and not self.use_old_metadata)
+            else bool(recompute_attack_from_metadata)
+        )
+
         self.input_features = self.metadata.get_input_features()
         self.drop_features = self.metadata.get_drop_features()
-        self.devices = self.metadata.devices  # dict[str, DeviceInfo]
+        self.devices = self.metadata.devices
 
         self.scaler_path = self.paths.scalers_dir.joinpath("scaler.pkl")
         self.pca_path = self.paths.scalers_dir.joinpath("pca.pkl")
@@ -79,35 +98,54 @@ class OldDataProcessor:
     # -------------
     def split_data(self, df: DataFrame, train_size=0.8) -> None:
         """
-        Old behavior:
-          - For each device, (optionally) recompute 'attack' using metadata.in_attacks
-          - Stratify on 'attack_number' when splitting
-          - Save train/val/test in processed/ as CSV
+        Old metadata (use_old_metadata=True):
+        - recompute attack from metadata.in_attacks
+        - treat attack_number as string
+        - stratify on attack_number (string) if available else attack
+
+        New metadata (use_old_metadata=False):
+        - do NOT recompute attack (trust labels)
+        - keep attack_number as int (no cast)
+        - prefer stratify on attack_number if it has >1 class in the device slice,
+            else stratify on attack if it has >1 class, else no stratify fallback
         """
         train_dfs, val_dfs, test_dfs = [], [], []
 
-        # ensure imeisv comparable type with metadata
+        # make imeisv comparable to metadata keys
         df["imeisv"] = df["imeisv"].astype(str)
+
+        # OLD mode: attack_number string categories (matches legacy behavior)
+        if self.use_old_metadata and "attack_number" in df.columns:
+            df["attack_number"] = df["attack_number"].astype(str)
 
         for dev_key, dev_info in self.devices.items():
             device_df = df.loc[df["imeisv"] == dev_info.imeisv].copy()
-
-            # If the raw file doesn't already have consistent 'attack' per device,
-            # re-derive it using metadata.in_attacks (old logic).
-            if "attack_number" in device_df.columns:
-                device_df.loc[
-                    device_df["attack_number"].isin(dev_info.in_attacks), "attack"
-                ] = 1
-                device_df.loc[
-                    ~device_df["attack_number"].isin(dev_info.in_attacks), "attack"
-                ] = 0
-
             if device_df.empty:
                 continue
 
-            # stratify on 'attack_number' if available; otherwise on 'attack'
-            strat_col = "attack_number" if "attack_number" in device_df.columns else "attack"
+            # OLD mode: recompute attack using in_attacks (string compare to match cast above)
+            if self.use_old_metadata and "attack_number" in device_df.columns:
+                in_set = {str(x) for x in getattr(dev_info, "in_attacks", [])}
+                device_df.loc[device_df["attack_number"].isin(in_set), "attack"] = 1
+                device_df.loc[~device_df["attack_number"].isin(in_set), "attack"] = 0
 
+            # Choose stratify column
+            if self.use_old_metadata:
+                # legacy: always stratify by attack_number if present, else attack
+                strat_col = "attack_number" if "attack_number" in device_df.columns else "attack"
+                use_strat = strat_col in device_df.columns
+            else:
+            # If the raw file doesn't already have consistent 'attack' per device,
+            # re-derive it using metadata.in_attacks (old logic).
+                if "attack_number" in device_df.columns:
+                    device_df.loc[
+                        device_df["attack_number"].isin(dev_info.in_attacks), "attack"
+                    ] = 1
+                    device_df.loc[
+                        ~device_df["attack_number"].isin(dev_info.in_attacks), "attack"
+                    ] = 0
+                strat_col = "attack_number" if "attack_number" in device_df.columns else "attack"
+            # Split train / (val+test)
             df_train, df_tmp = train_test_split(
                 device_df,
                 train_size=train_size,
@@ -122,6 +160,7 @@ class OldDataProcessor:
             val_dfs.append(df_val)
             test_dfs.append(df_test)
 
+        # Concatenate and save
         df_train = pd.concat(train_dfs).sort_values("_time").reset_index(drop=True)
         df_val = pd.concat(val_dfs).sort_values("_time").reset_index(drop=True)
         df_test = pd.concat(test_dfs).sort_values("_time").reset_index(drop=True)
@@ -145,8 +184,18 @@ class OldDataProcessor:
     # Scaling / PCA
     # -------------
     def _benign_mask(self, df: DataFrame):
-        if "attack_number" in df.columns:
-            return df["attack_number"] == 0
+        """
+        Old metadata: scaler fitted on rows with attack_number == "0" (string).
+        New metadata: scaler fitted on rows with attack == 0 (preferred), else attack_number == 0 (int).
+        """
+        if self.use_old_metadata:
+            if "attack_number" in df.columns:
+                # old code used strings for stratification/filters
+                return df["attack_number"].astype(str) == "0"
+        else:
+            # new code: trust 'attack' column as source of truth
+            if "attack_number" in df.columns:
+                return df["attack_number"] == 0
         if "attack" in df.columns:
             return df["attack"] == 0
         # fallback: use all

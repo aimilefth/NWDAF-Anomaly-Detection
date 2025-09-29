@@ -28,6 +28,7 @@ def _():
 
     logging.basicConfig(level=logging.INFO)
     mo.md("### 1) Imports ready")
+    USE_OLD_METADATA = True
     return (
         AlveoEvaluator,
         AlveoRunner,
@@ -35,6 +36,7 @@ def _():
         DataConfig,
         OldDataProcessor,
         PathConfig,
+        USE_OLD_METADATA,
         logging,
         mo,
         os,
@@ -42,11 +44,11 @@ def _():
 
 
 @app.cell
-def _(DataConfig, OldDataProcessor, PathConfig, logging, mo):
+def _(DataConfig, OldDataProcessor, PathConfig, USE_OLD_METADATA, logging, mo):
     mo.md("### 2) Build data pipeline (test)")
     dconf = DataConfig(seq_len=12)  # override here if you want: DataConfig(seq_len=..., batch_size=...)
     # 1) Initialize old data processor
-    dp = OldDataProcessor()    # 2) Ensure processed splits exist; if not, build them and fit scalers
+    dp = OldDataProcessor(use_old_metadata=USE_OLD_METADATA, recompute_attack_from_metadata=USE_OLD_METADATA)    # 2) Ensure processed splits exist; if not, build them and fit scalers
     pc = PathConfig()
     train_csv = pc.processed_dir.joinpath("train.csv")
     val_csv = pc.processed_dir.joinpath("val.csv")
