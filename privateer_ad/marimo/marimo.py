@@ -16,7 +16,7 @@ def _():
     import os
 
     from privateer_ad.config import DataConfig, PathConfig, MetadataConfig
-    from privateer_ad.etl.transform import DataProcessor
+    from privateer_ad.old_data_utils import OldDataProcessor
     from privateer_ad.alveo.alveo_runner import AlveoRunner, AlveoRunnerParameters
     from privateer_ad.evaluate.evaluator_alveo import AlveoEvaluator
     import torch
@@ -33,7 +33,7 @@ def _():
         AlveoRunner,
         AlveoRunnerParameters,
         DataConfig,
-        DataProcessor,
+        OldDataProcessor,
         PathConfig,
         logging,
         mo,
@@ -42,13 +42,29 @@ def _():
 
 
 @app.cell
-def _(DataConfig, DataProcessor, logging, mo):
+def _(DataConfig, OldDataProcessor, PathConfig, logging, mo):
     mo.md("### 2) Build data pipeline (test)")
-    dconf = DataConfig()  # override here if you want: DataConfig(seq_len=..., batch_size=...)
-    dp = DataProcessor(data_config=dconf)
+    dconf = DataConfig(seq_len=12)  # override here if you want: DataConfig(seq_len=..., batch_size=...)
+    # 1) Initialize old data processor
+    dp = OldDataProcessor()    # 2) Ensure processed splits exist; if not, build them and fit scalers
+    pc = PathConfig()
+    train_csv = pc.processed_dir.joinpath("train.csv")
+    val_csv = pc.processed_dir.joinpath("val.csv")
+    test_csv = pc.processed_dir.joinpath("test.csv")
+    if not (train_csv.exists() and val_csv.exists() and test_csv.exists()):
+        # This will split per device (stratified) and fit scaler (and PCA if you pass n_components)
+        dp.initialize_data_pipeline(dataset_path=pc.raw_dataset, train_size=0.8)
 
-    # Just to verify quickly; this does not load the whole dataset, only prepares it.
-    test_dl = dp.get_dataloader("test", only_benign=False, train=False)
+    # 3) Build a test dataloader with old defaults (seq_len=12, batch_size=4096)
+    test_dl= dp.get_dataloader(
+        split="test",
+        use_pca=False,        # flip to True if you fitted PCA in initialize_data_pipeline(n_components=...)
+        batch_size=4096,
+        seq_len=12,
+        partition_id=None,    # or an int if you want a federated-like partition
+        only_benign=False,
+        num_workers=16,
+    )
 
     logging.info(
         f"Data ready: seq_len={dconf.seq_len}, batch_size={dconf.batch_size}, features={len(dp.input_features)}"
