@@ -1,6 +1,6 @@
 # privateer_ad/evaluate/evaluate_alveo.py
 import logging
-from typing import Tuple, List, Dict, Optional, Any
+from typing import Tuple, List, Dict, Optional, Any, Union
 
 import numpy as np
 import torch
@@ -109,10 +109,26 @@ class AlveoEvaluator:
         threshold: Optional[float] = None,
         prefix: str = "",
         step: int = 0,
-    ) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        return_anomaly_scores: bool = False,
+    ) -> Union[Tuple[Dict[str, float], Dict[str, Any]], Tuple[Dict[str, float], Dict[str, Any], np.ndarray]]:
         """
         End-to-end evaluation with metrics, visuals, and (optional) MLflow logging.
         Mirrors ModelEvaluator.evaluate signature & behavior.
+
+        Args:
+            runner (AlveoRunner): The FPGA runner for model inference.
+            dataloader (DataLoader): DataLoader for evaluation data.
+            threshold (Optional[float]): Decision threshold. If None, it's computed.
+            prefix (str): Prefix for logged metric names.
+            step (int): Step/epoch for MLflow logging.
+            return_anomaly_scores (bool, optional): If True, also returns the computed
+                                                  anomaly scores. Defaults to False.
+
+        Returns:
+            Union[Tuple[Dict, Dict], Tuple[Dict, Dict, np.ndarray]]:
+                - Dictionary of computed metrics.
+                - Dictionary of generated visualization figures.
+                - If return_anomaly_scores, the numpy array of anomaly scores.
         """
         x, y_true, anomaly_scores = self.compute_anomaly_scores(runner, dataloader)
 
@@ -167,6 +183,8 @@ class AlveoEvaluator:
         metrics_logs = "\n".join([f"{k}: {v}" for k, v in metrics.items()])
         logging.info(f"Test metrics:\n{metrics_logs}")
 
+        if return_anomaly_scores:
+            return metrics, self.visualizer.figures, anomaly_scores
         return metrics, self.visualizer.figures
 
 

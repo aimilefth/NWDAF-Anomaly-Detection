@@ -1,5 +1,5 @@
 import logging
-from typing import Tuple, List
+from typing import Tuple, List, Union
 
 import mlflow
 import numpy as np
@@ -136,7 +136,7 @@ class ModelEvaluator:
         optimal_idx = np.argmin(np.sqrt(np.power(fpr, 2) + np.power(1 - tpr, 2)))
         return thresholds[optimal_idx]
 
-    def evaluate(self, model, dataloader, threshold: int = None, prefix='', step=0) -> Tuple[dict[str, float], dict]:
+    def evaluate(self, model, dataloader, threshold: int = None, prefix='', step=0, return_anomaly_scores: bool = False) -> Union[Tuple[dict[str, float], dict], Tuple[dict[str, float], dict, np.ndarray]]:
         """
         Perform comprehensive model evaluation with metrics computation and visualization.
 
@@ -160,11 +160,15 @@ class ModelEvaluator:
                                    sets (e.g., 'test_', 'val_').
             step (int, optional): Training step or epoch number for metric logging.
                                 Helps track performance evolution during training.
+            return_anomaly_scores (bool, optional): If True, also returns the computed
+                                        anomaly scores as a numpy array. Defaults to False.
 
         Returns:
-            Tuple[dict[str, float], dict]: A tuple containing:
+            Union[Tuple[dict[str, float], dict], Tuple[dict[str, float], dict, np.ndarray]]: A tuple containing:
                 - Dictionary of computed metrics with descriptive names
                 - Dictionary of generated visualization figures
+                - If return_anomaly_scores is True, a third element is returned:
+                    - np.ndarray of anomaly scores.
 
         Note:
             When MLflow tracking is active, this method automatically logs all
@@ -207,4 +211,6 @@ class ModelEvaluator:
                 mlflow.log_figure(fig, f'{str(step).zfill(3)}_{name}.png')
         metrics_logs = '\n'.join([f'{key}: {value}' for key, value in metrics.items()])
         logging.info(f'Test metrics:\n{metrics_logs}')
+        if return_anomaly_scores:
+            return metrics, self.visualizer.figures, anomaly_scores
         return metrics, self.visualizer.figures

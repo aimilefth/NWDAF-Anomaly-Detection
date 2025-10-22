@@ -26,20 +26,22 @@ def _():
     from privateer_ad.evaluate.evaluator import ModelEvaluator
     from privateer_ad.utils import load_model_weights
 
+    from privateer_ad.evaluate.approximation_comparison import approximation_comparison
+
     logging.basicConfig(level=logging.INFO)
     mo.md("### 1) Imports ready")
     USE_OLD_METADATA = False
+    PATHS = PathConfig()
     return (
-        AlveoEvaluator,
         AlveoRunner,
         AlveoRunnerParameters,
         DataConfig,
         ModelConfig,
-        ModelEvaluator,
         OldDataProcessor,
-        PathConfig,
+        PATHS,
         TransformerAD,
         USE_OLD_METADATA,
+        approximation_comparison,
         logging,
         mo,
         os,
@@ -48,18 +50,17 @@ def _():
 
 
 @app.cell
-def _(DataConfig, OldDataProcessor, PathConfig, USE_OLD_METADATA, logging, mo):
+def _(DataConfig, OldDataProcessor, PATHS, USE_OLD_METADATA, logging, mo):
     mo.md("### 2) Build data pipeline (test)")
     dconf = DataConfig(seq_len=12)  # override here if you want: DataConfig(seq_len=..., batch_size=...)
     # 1) Initialize old data processor
     dp = OldDataProcessor(use_old_metadata=USE_OLD_METADATA, recompute_attack_from_metadata=USE_OLD_METADATA)    # 2) Ensure processed splits exist; if not, build them and fit scalers
-    pc = PathConfig()
-    train_csv = pc.processed_dir.joinpath("train.csv")
-    val_csv = pc.processed_dir.joinpath("val.csv")
-    test_csv = pc.processed_dir.joinpath("test.csv")
+    train_csv = PATHS.processed_dir.joinpath("train.csv")
+    val_csv = PATHS.processed_dir.joinpath("val.csv")
+    test_csv = PATHS.processed_dir.joinpath("test.csv")
     if not (train_csv.exists() and val_csv.exists() and test_csv.exists()):
         # This will split per device (stratified) and fit scaler (and PCA if you pass n_components)
-        dp.initialize_data_pipeline(dataset_path=pc.raw_dataset, train_size=0.8)
+        dp.initialize_data_pipeline(dataset_path=PATHS.raw_dataset, train_size=0.8)
 
     # 3) Build a test dataloader with old defaults (seq_len=12, batch_size=4096)
     test_dl= dp.get_dataloader(
@@ -99,7 +100,7 @@ def _(mo):
 def _(
     AlveoRunner,
     AlveoRunnerParameters,
-    PathConfig,
+    PATHS,
     dconf,
     device_list,
     dp,
@@ -107,7 +108,7 @@ def _(
     os,
 ):
     mo.md("### 4) Create Alveo runner")
-    XCLBIN_PATH = os.path.join(PathConfig().experiments_dir, "alveo_xclbins", "attention_ae_adv_W32A32.xclbin")
+    XCLBIN_PATH = os.path.join(PATHS.experiments_dir, "alveo_xclbins", "attention_ae_adv_W32A32.xclbin")
 
     # Bus can be None if you only want overlay + kernel (no power scraping)
     DEVICE_BUS = None  # e.g. "0000:af:00.1"
@@ -138,102 +139,76 @@ def _(
 
 
 @app.cell
-def _(AlveoEvaluator, mo, runner, test_dl):
-    mo.md("### 5) Evaluate on Alveo")
-    try:
-        if runner is None:
-            raise RuntimeError("AlveoRunner is not initialized (see cell 4).")
+def _(ModelConfig, PATHS, TransformerAD, mo, os, torch):
+    mo.md("### 5) Create `adv_trained_model.pt` on CPU/GPU")
 
-        evaluator = AlveoEvaluator()
-        metrics, figures = evaluator.evaluate(
-            runner=runner,
-            dataloader=test_dl,
-            threshold=0.0209596287459135,
-            prefix="alveo",
-            step=0,
-        )
-        print("== Alveo Evaluation Metrics ==")
-        for k, v in metrics.items():
-            print(f"{k}: {v}")
-        print("\nFigures available in `figures` dict (matplotlib Figure objects).")
-    except Exception as e:
-        metrics, figures = {}, {}
-        print(f"Evaluation failed: {e}")
-    metrics, figures
+    # 1. Define Paths and Configuration
+    cuda_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_path = os.path.join(PATHS.experiments_dir, "adv_trained_model.pt")
+
+    # This config matches the architecture of the model
+    adv_model_config = ModelConfig(
+        input_size=8,
+        seq_len=12,
+        embed_dim=32,      # Corresponds to old 'hidden_dim'
+        latent_dim=16,     # Corresponds to old 'latent_dim' & 'dim_feedforward'
+        num_heads=1,
+        num_layers=1,
+        dropout=0.1
+    )
+
+    # 2. Instantiate the new model architecture
+    adv_model = TransformerAD(model_config=adv_model_config)
+    print(f"Instantiated new TransformerAD model structure.")
+
+    # 3. Load the state dictionary from the old model file
+    print(f"Loading weights from: {model_path}")
+    state_dict = torch.load(model_path, map_location=cuda_device)
+    adv_model.load_state_dict(state_dict)
+    adv_model.to(cuda_device)
+    adv_model.eval()
+    print("Successfully loaded 'adv_trained_model.pt' weights.")
+    return (adv_model,)
+
+
+@app.cell
+def _(adv_model, approximation_comparison, mo, runner, test_dl, torch):
+    mo.md("### 6) Golden vs Approximated: Approximation Comparison (adv_trained_model.pt vs Alveo W32A32)")
+
+    THRESHOLD = 0.0209596287459135
+
+    result = approximation_comparison(
+        golden_model=adv_model,
+        approximated=runner,
+        dataloader=test_dl,
+        threshold=THRESHOLD,
+        device=("cuda" if torch.cuda.is_available() else "cpu"),
+        loss_fn_name="L1Loss",
+    )
+
+    # Print a compact summary
+    summary = result["comparison"]["summary"]
+    print("=== Approximation Summary ===")
+    for k, v in summary.items():
+        print(f"{k}: {v:.6f}" if isinstance(v, float) else f"{k}: {v}")
+
+    # The dict contains:
+    #  - result['golden']['metrics'|'figures']
+    #  - result['approx']['metrics'|'figures']
+    #  - result['comparison']['per_sample'|'summary'|'figures']
+    result  # show in Marimo
+    return (result,)
+
+
+@app.cell
+def _(result):
+    result['golden']['figures'], result['approx']['figures'], result['comparison']['figures']
     return
 
 
 @app.cell
 def _(runner):
     runner.clean_class()
-    return
-
-
-@app.cell
-def _(
-    ModelConfig,
-    ModelEvaluator,
-    PathConfig,
-    TransformerAD,
-    mo,
-    test_dl,
-    torch,
-):
-    mo.md("### 6) Evaluate `adv_trained_model.pt` on CPU/GPU")
-    try:
-        # 1. Define Paths and Configuration
-        paths = PathConfig()
-        cuda_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model_path = paths.experiments_dir / "adv_trained_model.pt"
-
-        # This config matches the architecture of the model
-        adv_model_config = ModelConfig(
-            input_size=8,
-            seq_len=12,
-            embed_dim=32,      # Corresponds to old 'hidden_dim'
-            latent_dim=16,     # Corresponds to old 'latent_dim' & 'dim_feedforward'
-            num_heads=1,
-            num_layers=1,
-            dropout=0.1
-        )
-
-        # 2. Instantiate the new model architecture
-        adv_model = TransformerAD(model_config=adv_model_config)
-        print(f"Instantiated new TransformerAD model structure.")
-
-        # 3. Load the state dictionary from the old model file
-        print(f"Loading weights from: {model_path}")
-        state_dict = torch.load(model_path, map_location=cuda_device)
-        adv_model.load_state_dict(state_dict)
-        adv_model.to(cuda_device)
-        adv_model.eval()
-        print("Successfully loaded 'adv_trained_model.pt' weights.")
-
-        # 4. Initialize the evaluator 
-        evaluator_cpu = ModelEvaluator(device=cuda_device, loss_fn="L1Loss")
-
-        # 5. Run evaluation using the existing test_dl from cell #2
-        print("\nRunning evaluation...")
-        adv_metrics, adv_figures = evaluator_cpu.evaluate(
-            model=adv_model,
-            dataloader=test_dl,
-            threshold=0.0209596287459135,
-            prefix="adv_model_eval"
-        )
-
-        print("\n=== Advanced Model Evaluation Metrics ===")
-        for k1, v1 in adv_metrics.items():
-            print(f"{k1}: {v1}")
-        print("\nEvaluation complete. Figures are available in the `adv_figures` dict.")
-
-    except Exception as e:
-        adv_metrics, adv_figures = {}, {}
-        print(f"An error occurred during evaluation: {e}")
-        import traceback
-        traceback.print_exc()
-
-    # Display a summary of the results in Marimo
-    adv_metrics, adv_figures
     return
 
 
