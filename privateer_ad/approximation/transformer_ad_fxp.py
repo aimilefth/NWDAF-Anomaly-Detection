@@ -254,6 +254,12 @@ class FxpTransformerAD(TransformerADTransparent):
         self.compress[0].set_no_overflow_quant(same_wb)
         self.output.set_no_overflow_quant(same_wb)
 
+    def set_min_mse_quant(self, depth: int = 10) -> None:
+        self.embed.set_min_mse_quant(depth)
+        self.encoder_layer.set_min_mse_quant(depth)
+        self.norm_layer.set_min_mse_quant(depth)
+        self.compress[0].set_min_mse_quant(depth)
+        self.output.set_min_mse_quant(depth)
 
 def create_dynamic_qconfig(
     weight_bits: int,
