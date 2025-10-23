@@ -1,0 +1,3 @@
+[submodule "privateer_ad/approximation/FxPyTorch"]
+	path = privateer_ad/approximation/FxPyTorch
+	url = https://github.com/aimilefth/FxPyTorch.git

@@ -26,22 +26,37 @@ def _():
     from privateer_ad.evaluate.evaluator import ModelEvaluator
     from privateer_ad.utils import load_model_weights
 
+    from privateer_ad.approximation.transformer_ad_fxp import (
+        FxpTransformerAD,
+        FxPTransformerADConfig,
+        TransformerADQConfig,
+        create_dynamic_qconfig,
+    )
+
     from privateer_ad.evaluate.approximation_comparison import approximation_comparison
 
     logging.basicConfig(level=logging.INFO)
     mo.md("### 1) Imports ready")
+
     USE_OLD_METADATA = False
     PATHS = PathConfig()
+    THRESHOLD = 0.0209596287459135
+    cuda_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return (
         AlveoRunner,
         AlveoRunnerParameters,
         DataConfig,
+        FxPTransformerADConfig,
+        FxpTransformerAD,
         ModelConfig,
         OldDataProcessor,
         PATHS,
+        THRESHOLD,
         TransformerAD,
         USE_OLD_METADATA,
         approximation_comparison,
+        create_dynamic_qconfig,
+        cuda_device,
         logging,
         mo,
         os,
@@ -73,11 +88,22 @@ def _(DataConfig, OldDataProcessor, PATHS, USE_OLD_METADATA, logging, mo):
         num_workers=16,
     )
 
+    val_dl= dp.get_dataloader(
+        split="val",
+        use_pca=False,        # flip to True if you fitted PCA in initialize_data_pipeline(n_components=...)
+        batch_size=131072,
+        seq_len=12,
+        partition_id=None,    # or an int if you want a federated-like partition
+        only_benign=True,
+        num_workers=16,
+    )
+
+
     logging.info(
         f"Data ready: seq_len={dconf.seq_len}, batch_size={dconf.batch_size}, features={len(dp.input_features)}"
     )
-    len(test_dl)  # small peek makes Marimo display something
-    return dconf, dp, test_dl
+    (len(val_dl), len(test_dl)) # Display tuple of lengths
+    return dconf, dp, test_dl, val_dl
 
 
 @app.cell
@@ -108,7 +134,7 @@ def _(
     os,
 ):
     mo.md("### 4) Create Alveo runner")
-    XCLBIN_PATH = os.path.join(PATHS.experiments_dir, "alveo_xclbins", "attention_ae_adv_W32A32.xclbin")
+    XCLBIN_PATH = os.path.join(PATHS.experiments_dir, "alveo_xclbins", "attention_ae_adv_W32A32_v2.xclbin")
 
     # Bus can be None if you only want overlay + kernel (no power scraping)
     DEVICE_BUS = None  # e.g. "0000:af:00.1"
@@ -139,11 +165,11 @@ def _(
 
 
 @app.cell
-def _(ModelConfig, PATHS, TransformerAD, mo, os, torch):
+def _(ModelConfig, PATHS, TransformerAD, cuda_device, mo, os, torch):
     mo.md("### 5) Create `adv_trained_model.pt` on CPU/GPU")
 
     # 1. Define Paths and Configuration
-    cuda_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     model_path = os.path.join(PATHS.experiments_dir, "adv_trained_model.pt")
 
     # This config matches the architecture of the model
@@ -168,47 +194,165 @@ def _(ModelConfig, PATHS, TransformerAD, mo, os, torch):
     adv_model.to(cuda_device)
     adv_model.eval()
     print("Successfully loaded 'adv_trained_model.pt' weights.")
-    return (adv_model,)
+    return adv_model, adv_model_config, state_dict
 
 
 @app.cell
-def _(adv_model, approximation_comparison, mo, runner, test_dl, torch):
-    mo.md("### 6) Golden vs Approximated: Approximation Comparison (adv_trained_model.pt vs Alveo W32A32)")
+def _(
+    FxPTransformerADConfig,
+    FxpTransformerAD,
+    adv_model_config,
+    create_dynamic_qconfig,
+    cuda_device,
+    mo,
+    state_dict,
+    torch,
+    val_dl,
+):
+    mo.md("### 6) Create FxPTransformerAD Model (W32A32)")
 
-    THRESHOLD = 0.0209596287459135
+    # 1. Define QConfig for 32-bit weights and activations
+    w32a32_qconfig = create_dynamic_qconfig(weight_bits=32, activation_bits=32)
 
-    result = approximation_comparison(
+    # 2. Instantiate FxP model
+    # Use the same base config as the floating point model
+    fxp_model_config = FxPTransformerADConfig(**adv_model_config.model_dump())
+    fxp_model = FxpTransformerAD(config=fxp_model_config, q_config=w32a32_qconfig)
+
+    # 3. Load weights from the pre-trained float model
+    fxp_model.load_state_dict(state_dict)
+    fxp_model.to(cuda_device)
+    fxp_model.eval()
+
+    print("Successfully instantiated FxpTransformerAD (W32A32) and loaded weights.")
+
+    # 3. Calibrate the FxP Model"
+
+    # a. Get one batch from validation dataloader for calibration
+    calibration_batch = next(iter(val_dl))[0]["encoder_cont"]
+    calibration_input = calibration_batch.to(cuda_device)
+    print(f"Using one batch of validation data for calibration. Shape: {calibration_input.shape}")
+
+    # b. Set weight quantization based on their values (no-overflow)
+    fxp_model.set_no_overflow_quant()
+    print("Set no-overflow fractional bits for weights.")
+
+    # c. Run calibration pass to set activation quantization
+    with torch.no_grad():
+        _ = fxp_model(calibration_input, calibrate=True, calibration_type="no_overflow")
+    print("Ran calibration pass for activations.")
+
+    # d. Permanently quantize weights and biases
+    #fxp_model.quantize_weights_bias()
+    #print("Permanently quantized model weights and biases.")
+    return calibration_input, fxp_model
+
+
+@app.cell
+def _(
+    THRESHOLD,
+    adv_model,
+    approximation_comparison,
+    cuda_device,
+    fxp_model,
+    mo,
+    runner,
+    test_dl,
+):
+    mo.md("### 8) Golden vs Approximated: Comparison Runs")
+
+    loss_fn = "L1Loss"
+
+    # --- 8.1: Golden (Float) vs Approximated (FxP W32A32) ---
+    mo.md("#### 8.1) Golden (Float) vs. Approximated (FxP W32A32)")
+    result_float_vs_fxp = approximation_comparison(
+        golden_model=adv_model,
+        approximated=fxp_model,
+        dataloader=test_dl,
+        threshold=THRESHOLD,
+        device=cuda_device,
+        loss_fn_name=loss_fn,
+    )
+
+    # --- 8.2: Golden (Float) vs Approximated (Alveo W32A32) ---
+    mo.md("#### 8.2) Golden (Float) vs. Approximated (Alveo W32A32)")
+    result_float_vs_alveo = approximation_comparison(
         golden_model=adv_model,
         approximated=runner,
         dataloader=test_dl,
         threshold=THRESHOLD,
-        device=("cuda" if torch.cuda.is_available() else "cpu"),
-        loss_fn_name="L1Loss",
+        device=cuda_device,
+        loss_fn_name=loss_fn,
     )
 
-    # Print a compact summary
-    summary = result["comparison"]["summary"]
-    print("=== Approximation Summary ===")
-    for k, v in summary.items():
-        print(f"{k}: {v:.6f}" if isinstance(v, float) else f"{k}: {v}")
+    # --- 8.3: Golden (FxP W32A32) vs Approximated (Alveo W32A32) ---
+    mo.md("#### 8.3) Golden (FxP W32A32) vs. Approximated (Alveo W32A32)")
+    result_fxp_vs_alveo = approximation_comparison(
+        golden_model=fxp_model,
+        approximated=runner,
+        dataloader=test_dl,
+        threshold=THRESHOLD,
+        device=cuda_device,
+        loss_fn_name=loss_fn,
+    )
 
-    # The dict contains:
-    #  - result['golden']['metrics'|'figures']
-    #  - result['approx']['metrics'|'figures']
-    #  - result['comparison']['per_sample'|'summary'|'figures']
-    result  # show in Marimo
-    return (result,)
+    # Display summaries
+    print("--- Summary: Float vs FxP ---")
+    print({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in result_float_vs_fxp["comparison"]["summary"].items()})
+    print("\n--- Summary: Float vs Alveo ---")
+    print({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in result_float_vs_alveo["comparison"]["summary"].items()})
+    print("\n--- Summary: FxP vs Alveo ---")
+    print({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in result_fxp_vs_alveo["comparison"]["summary"].items()})
+    return result_float_vs_alveo, result_float_vs_fxp, result_fxp_vs_alveo
 
 
 @app.cell
-def _(result):
-    result['golden']['figures'], result['approx']['figures'], result['comparison']['figures']
+def _(mo, result_float_vs_alveo, result_float_vs_fxp, result_fxp_vs_alveo):
+    mo.md("### 9) Comparison Figures")
+
+    result_float_vs_fxp['comparison']['figures'],  result_float_vs_alveo['comparison']['figures'], result_fxp_vs_alveo['comparison']['figures'], 
     return
 
 
 @app.cell
 def _(runner):
     runner.clean_class()
+    return
+
+
+@app.cell
+def _(calibration_input, fxp_model, os):
+    from privateer_ad.approximation.utils.export_weights import (
+            convert_model_to_json_ae,
+            convert_json_to_h_ae,
+            post_process_header_for_specific_types,
+        )
+
+    OUTPUT_DIR = os.path.join("app", "outputs", "fxp_w32a32_2")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # Save the final, calibrated qconfig for inspection
+    qconfig_w32_a32_path = os.path.join(
+        OUTPUT_DIR, "adv_model_w32_a32_qconfig.json"
+    )
+    with open(qconfig_w32_a32_path, "w") as f:
+        f.write(fxp_model.q_config.model_dump_json(indent=2))
+    print(f"\nSaved calibrated QConfig to {qconfig_w32_a32_path}")
+
+    # Export weights to JSON and H files
+    json_path_w32_a32 = os.path.join(OUTPUT_DIR , "adv_model_w32_a32.json")
+    h_path_w32_a32 = os.path.join(OUTPUT_DIR , "adv_model_w32_a32.h")
+
+    print(
+        f"\nExporting float model weights to {json_path_w32_a32} and {h_path_w32_a32}..."
+    )
+    convert_model_to_json_ae(
+        fxp_model,
+        filename=json_path_w32_a32,
+        input_shape=calibration_input.shape,
+    )
+    convert_json_to_h_ae(json_filename=json_path_w32_a32, h_filename=h_path_w32_a32)
+    post_process_header_for_specific_types(h_filename=h_path_w32_a32)
     return
 
 
