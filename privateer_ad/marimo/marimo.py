@@ -33,7 +33,7 @@ def _():
         create_dynamic_qconfig,
     )
 
-    from privateer_ad.evaluate.approximation_comparison import approximation_comparison
+    from privateer_ad.approximation.approximation_comparison import approximation_comparison
 
     logging.basicConfig(level=logging.INFO)
     mo.md("### 1) Imports ready")
@@ -321,7 +321,9 @@ def _(runner):
 
 
 @app.cell
-def _(calibration_input, fxp_model, os):
+def _(calibration_input, fxp_model, mo, os):
+    mo.md("### 10) Save Approximation Weights and QConfig for use in HLS")
+
     from privateer_ad.approximation.utils.export_weights import (
             convert_model_to_json_ae,
             convert_json_to_h_ae,

@@ -9,7 +9,7 @@ import torch
 from privateer_ad.alveo.alveo_runner import AlveoRunner
 from privateer_ad.evaluate.evaluator import ModelEvaluator
 from privateer_ad.evaluate.evaluator_alveo import AlveoEvaluator
-
+from privateer_ad.approximation.transformer_ad_fxp import TransformerADQConfig
 
 def _fig_line(values: List[float], title: str, ylabel: str) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(10, 4))
