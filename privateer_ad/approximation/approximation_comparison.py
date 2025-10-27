@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional, Union
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import mlflow
+from sklearn.metrics import classification_report
 
 from privateer_ad.alveo.alveo_runner import AlveoRunner
 from privateer_ad.evaluate.evaluator import ModelEvaluator
@@ -152,3 +154,66 @@ def approximation_comparison(
         + ", ".join([f"{k}={v:.6f}" for k, v in comparison_summary.items() if isinstance(v, float)])
     )
     return result
+
+def approximation_comparison_mlflow(
+    golden_model: torch.nn.Module,
+    approximated: Union[torch.nn.Module, AlveoRunner],
+    dataloader,
+    threshold: float,
+    mlflow_run_name: str,
+    mlflow_params: dict,
+    q_config: TransformerADQConfig = None,
+    device: Optional[Union[str, torch.device]] = None,
+    loss_fn_name: str = "L1Loss",
+) -> Dict[str, Any]:
+    """
+    Runs approximation_comparison and logs all parameters, metrics, and artifacts to MLflow.
+    """
+    try:
+        mlflow.start_run(run_name=mlflow_run_name)
+        logging.info(f"Started MLflow run: {mlflow_run_name}")
+
+        # Log DSE parameters
+        mlflow.log_params(mlflow_params)
+
+        # Log the calibrated QConfig as an artifact
+        if q_config:
+            mlflow.log_dict(q_config.model_dump(mode="json"), "qconfig_calibrated.json")
+
+        # Run the core comparison
+        result = approximation_comparison(
+            golden_model=golden_model,
+            approximated=approximated,
+            dataloader=dataloader,
+            threshold=threshold,
+            device=device,
+            loss_fn_name=loss_fn_name,
+        )
+
+        # Log all metrics
+        mlflow.log_metrics(result["golden"]["metrics"])
+        mlflow.log_metrics(result["approx"]["metrics"])
+        mlflow.log_metrics(result["comparison"]["summary"])
+        
+        # Log all figures. Commented out because evaluate logs all those
+        for name, fig in result["golden"]["figures"].items():
+            # mlflow.log_figure(fig, f"golden_{name}.png")
+            plt.close(fig)
+        for name, fig in result["approx"]["figures"].items():
+            # mlflow.log_figure(fig, f"approx_{name}.png")
+            plt.close(fig)
+        for name, fig in result["comparison"]["figures"].items():
+            mlflow.log_figure(fig, f"comparison_{name}.png")
+            plt.close(fig)
+        
+        logging.info("Successfully logged all results to MLflow.")
+        return result
+
+    except Exception as e:
+        logging.error(f"MLflow logging or evaluation failed for run {mlflow_run_name}: {e}", exc_info=True)
+        # Return an error structure so the DSE can continue
+        return {"error": str(e)}
+    finally:
+        if mlflow.active_run():
+            mlflow.end_run()
+            logging.info(f"Ended MLflow run: {mlflow_run_name}")

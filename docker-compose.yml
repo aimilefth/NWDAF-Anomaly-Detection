@@ -15,7 +15,8 @@ services:
     command: >
       mlflow server
       --backend-store-uri sqlite:////database/mlflow.db
-      --default-artifact-root /mlruns
+      --serve-artifacts
+      --artifacts-destination /mlruns
       --host ${PRIVATEER_MLFLOW_SERVER_IP}
       --port ${PRIVATEER_MLFLOW_SERVER_PORT}
     environment:
@@ -34,8 +35,8 @@ services:
     # Mount the entire project directory into the container at /app
     # This allows for live code changes without rebuilding the image.
       - .:/app
-      # Mount the same artifact path as the mlflow service
-      - ${PRIVATEER_MLFLOW_ARTIFACT_PATH}:/mlruns
+      # # Mount the same artifact path as the mlflow service
+      # - ${PRIVATEER_MLFLOW_ARTIFACT_PATH}:/mlruns
     command: ["sleep", "infinity"] 
     env_file:
       - .env
