@@ -23,6 +23,7 @@ class ModelWrapperForART(nn.Module):
     ):
         super().__init__()
         self.model = model
+        self.model.eval()
         self.threshold = threshold
         self.criterion = nn.L1Loss(reduction="none")
 
@@ -35,9 +36,7 @@ class ModelWrapperForART(nn.Module):
         anomaly_prob = torch.sigmoid(
             (reconstruction_error - self.threshold) / self.threshold
         )
-
-        # ART expects a probability distribution over classes (benign, malicious)
-        return torch.stack([1 - anomaly_prob, anomaly_prob], dim=1)
+        return anomaly_prob
 
 
 def create_adversarial_attacker(
@@ -66,7 +65,7 @@ def create_adversarial_attacker(
     art_model_wrapper = ModelWrapperForART(model, threshold)
     art_classifier = PyTorchClassifier(
         model=art_model_wrapper,
-        loss=nn.CrossEntropyLoss(),
+        loss=nn.BCELoss(),
         input_shape=(model_config.seq_len, model_config.input_size),
         nb_classes=2,
         device_type=device,
@@ -75,7 +74,10 @@ def create_adversarial_attacker(
     return ProjectedGradientDescentPyTorch(
         art_classifier,
         eps=eps,
+        eps_step=.0005,
+        norm="inf",
         max_iter=max_iter,
+        targeted=True,
         batch_size=batch_size,
         verbose=False,
     )

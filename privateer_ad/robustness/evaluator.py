@@ -43,7 +43,7 @@ def evaluate_robustness(
 
         # Create a new attacker for each epsilon value
         attacker = create_adversarial_attacker(
-            model, model_config, threshold, eps, max_iter=10, device=device, batch_size=batch_size
+            model, model_config, threshold, eps, max_iter=250, device=device, batch_size=batch_size
         )
 
         for batch in tqdm(dataloader, desc=f"Attacking with eps={eps}"):
@@ -70,10 +70,7 @@ def evaluate_robustness(
                 torch.abs(original_outputs - inputs).mean(dim=(1, 2)).cpu().numpy()
             )
             adversarial_errors = (
-                torch.abs(adversarial_outputs - adversarial_inputs)
-                .mean(dim=(1, 2))
-                .cpu()
-                .numpy()
+                torch.abs(adversarial_outputs - adversarial_inputs).mean(dim=(1, 2)).cpu().numpy()
             )
 
             original_predictions = (original_errors > threshold).astype(int)
