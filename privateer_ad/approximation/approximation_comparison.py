@@ -119,8 +119,12 @@ def approximation_comparison(
     diffs_arr = np.asarray(anomaly_abs_diffs, dtype=np.float64)
 
     comparison_summary = {
-        "anomaly_score_abs_diff_mean": float(diffs_arr.mean()) if diffs_arr.size else float("nan"),
-        "anomaly_score_abs_diff_std": float(diffs_arr.std(ddof=1)) if diffs_arr.size > 1 else float("nan"),
+        "anomaly_score_abs_diff_mean": float(diffs_arr.mean())
+        if diffs_arr.size
+        else float("nan"),
+        "anomaly_score_abs_diff_std": float(diffs_arr.std(ddof=1))
+        if diffs_arr.size > 1
+        else float("nan"),
     }
 
     # ----------------
