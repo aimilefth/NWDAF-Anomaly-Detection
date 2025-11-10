@@ -1,4 +1,4 @@
-FROM aimilefth/privateer-ad:app
+FROM aimilefth/privateer-ad:app-adv
 
 ENV DEBIAN_FRONTEND=noninteractive
 ARG XRT_GIT_URL=https://github.com/Xilinx/XRT.git

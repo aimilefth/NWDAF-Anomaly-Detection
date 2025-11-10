@@ -1,6 +1,6 @@
 # privateer_ad/evaluate/approximation_comparison.py
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -12,6 +12,9 @@ from privateer_ad.alveo.alveo_runner import AlveoRunner
 from privateer_ad.evaluate.evaluator import ModelEvaluator
 from privateer_ad.evaluate.evaluator_alveo import AlveoEvaluator
 from privateer_ad.approximation.transformer_ad_fxp import TransformerADQConfig
+from privateer_ad.robustness.evaluator import evaluate_robustness
+from privateer_ad.config import ModelConfig
+
 
 def _fig_line(values: List[float], title: str, ylabel: str) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(10, 4))
@@ -42,7 +45,9 @@ def approximation_comparison(
     threshold: float,
     device: Optional[Union[str, torch.device]] = None,
     loss_fn_name: str = "L1Loss",
-) -> Dict[str, Any]:
+    calculated_golden: Optional[Tuple[Dict, Dict, np.ndarray]] = None,
+    return_golden_scores: bool = False,
+) -> Union[Dict[str, Any], Tuple[Dict[str, Any], np.ndarray]]:
     """
     Compare a 'golden' PyTorch model vs an approximated model (PyTorch or AlveoRunner).
 
@@ -57,8 +62,18 @@ def approximation_comparison(
       4) Produce figures visualizing the per-sample score differences
          (line plot) and their distribution (histogram).
 
+    Args:
+        # ... (other args)
+        calculated_golden (Optional[Tuple]): Pre-computed results for the golden model
+                                             in the format (metrics, figures, scores)
+                                             to avoid re-calculation.
+        return_golden_scores (bool): If True, returns the golden_scores as a second
+                                     element in a tuple.
+
     Returns:
-      dict with keys:
+      A dictionary with the results, or a tuple (results_dict, golden_scores)
+      if return_golden_scores is True.
+      results_dict is:
         - 'golden': {'metrics': ..., 'figures': ...} from the evaluation run.
         - 'approx': {'metrics': ..., 'figures': ...} from the evaluation run.
         - 'comparison': {
@@ -85,12 +100,17 @@ def approximation_comparison(
     # -----------------------
     # 1) Full evaluator runs
     # -----------------------
-    # Golden: always a torch model
-    golden_model = golden_model.to(device)
-    golden_eval = ModelEvaluator(device=device, loss_fn=loss_fn_name)
-    golden_metrics, golden_figures, golden_scores = golden_eval.evaluate(
-        model=golden_model, dataloader=dataloader, threshold=threshold, prefix="golden", step=0, return_anomaly_scores=True
-    )
+    # Golden: use pre-calculated results if provided
+    if calculated_golden:
+        logging.info("Using pre-calculated results for the golden model.")
+        golden_metrics, golden_figures, golden_scores = calculated_golden
+    else:
+        logging.info("Calculating results for the golden model.")
+        golden_model = golden_model.to(device)
+        golden_eval = ModelEvaluator(device=device, loss_fn=loss_fn_name)
+        golden_metrics, golden_figures, golden_scores = golden_eval.evaluate(
+            model=golden_model, dataloader=dataloader, threshold=threshold, prefix="golden", step=0, return_anomaly_scores=True
+        )
 
     # Approx: either torch model or Alveo
     approx_metrics, approx_figures = {}, {}
@@ -157,6 +177,8 @@ def approximation_comparison(
         "Approximation comparison summary: "
         + ", ".join([f"{k}={v:.6f}" for k, v in comparison_summary.items() if isinstance(v, float)])
     )
+    if return_golden_scores:
+        return result, golden_scores
     return result
 
 def approximation_comparison_mlflow(
@@ -169,6 +191,10 @@ def approximation_comparison_mlflow(
     q_config: TransformerADQConfig = None,
     device: Optional[Union[str, torch.device]] = None,
     loss_fn_name: str = "L1Loss",
+    check_robustness_approx: bool = False,
+    check_robustness_golden: bool = False,
+    calculated_golden: Optional[Tuple] = None,
+    calculated_golden_robustness: Optional[Dict] = None,
 ) -> Dict[str, Any]:
     """
     Runs approximation_comparison and logs all parameters, metrics, and artifacts to MLflow.
@@ -192,14 +218,48 @@ def approximation_comparison_mlflow(
             threshold=threshold,
             device=device,
             loss_fn_name=loss_fn_name,
+            calculated_golden=calculated_golden
         )
 
         # Log all metrics
         mlflow.log_metrics(result["golden"]["metrics"])
         mlflow.log_metrics(result["approx"]["metrics"])
         mlflow.log_metrics(result["comparison"]["summary"])
-        
-        # Log all figures. Commented out because evaluate logs all those
+
+        # Golden Robustness Evaluation
+        if check_robustness_golden:
+            if calculated_golden_robustness:
+                robustness_metrics_golden = calculated_golden_robustness
+                logging.info("Using pre-calculated golden robustness metrics.")
+            else:
+                logging.info("Checking adversarial robustness for golden model...")
+                robustness_metrics_golden = evaluate_robustness(
+                    model=golden_model,
+                    model_config=ModelConfig(),
+                    dataloader=dataloader,
+                    threshold=threshold,
+                    epsilons=[0.1],
+                    device=device,
+                )
+            mlflow.log_metrics({f"golden_{k}": v for k, v in robustness_metrics_golden.items()})
+            result["golden_robustness_metrics"] = robustness_metrics_golden
+
+        # Approximated Model Robustness Evaluation
+        if check_robustness_approx and not isinstance(approximated, AlveoRunner):
+            logging.info("Checking adversarial robustness for approximated model...")
+            robustness_metrics_approx = evaluate_robustness(
+                model=approximated,
+                model_config=ModelConfig(),
+                dataloader=dataloader,
+                threshold=threshold,
+                epsilons=[0.1],
+                device=device,
+            )
+            mlflow.log_metrics({f"approx_{k}": v for k, v in robustness_metrics_approx.items()})
+            logging.info(f"Approx robustness metrics: {robustness_metrics_approx}")
+            result["approx_robustness_metrics"] = robustness_metrics_approx
+
+        # Log all figures.
         for name, fig in result["golden"]["figures"].items():
             # mlflow.log_figure(fig, f"golden_{name}.png")
             plt.close(fig)

@@ -4,7 +4,6 @@ import json
 import time
 from datetime import datetime
 import itertools
-import copy
 import logging
 
 import mlflow
@@ -24,6 +23,9 @@ from privateer_ad.approximation.transformer_ad_fxp import (
     create_dynamic_qconfig,
 )
 from privateer_ad.approximation.approximation_comparison import approximation_comparison_mlflow
+from privateer_ad.evaluate import ModelEvaluator
+from privateer_ad.robustness.evaluator import evaluate_robustness
+
 
 logging.basicConfig(level=logging.INFO)
 
@@ -92,6 +94,29 @@ def ptq_dse():
     golden_model.eval()
     logging.info("Golden model loaded successfully.")
 
+    # --- Pre-calculate Golden Model results to avoid re-computation ---
+    logging.info("Pre-calculating evaluation results for the golden model...")
+    golden_evaluator = ModelEvaluator(device=device, loss_fn="L1Loss")
+    golden_metrics, golden_figures, golden_scores = golden_evaluator.evaluate(
+        model=golden_model,
+        dataloader=test_dl,
+        threshold=THRESHOLD,
+        prefix="golden",
+        return_anomaly_scores=True
+    )
+    calculated_golden = (golden_metrics, golden_figures, golden_scores)
+    
+    logging.info("Pre-calculating robustness for the golden model...")
+    calculated_golden_robustness = evaluate_robustness(
+        model=golden_model,
+        model_config=PRETRAINED_MODEL_CONFIG,
+        dataloader=test_dl,
+        threshold=THRESHOLD,
+        epsilons=[0.1],
+        device=device,
+    )
+    logging.info(f"Golden model robustness pre-calculated: {calculated_golden_robustness}")
+
     # --- DSE Loop ---
     dse_configurations = list(itertools.product(
         weight_bits_options,
@@ -153,6 +178,10 @@ def ptq_dse():
             mlflow_params=dse_params,
             q_config=approximated_model.q_config,
             device=device,
+            check_robustness_approx=True,
+            check_robustness_golden=True,
+            calculated_golden=calculated_golden,
+            calculated_golden_robustness=calculated_golden_robustness,
         )
 
         end_time = time.perf_counter()

@@ -24,7 +24,7 @@ services:
       - MLFLOW_SERVER_IP=${PRIVATEER_MLFLOW_SERVER_IP}
 
   app:
-    image: aimilefth/privateer-ad:app
+    image: aimilefth/privateer-ad:app-adv
     pull_policy: always
     # # Use this if wanting to build
     # build:
@@ -48,7 +48,7 @@ services:
       stack: 67108864
 
   app-fpga:
-    image: aimilefth/privateer-ad:app-fpga
+    image: aimilefth/privateer-ad:app-fpga-adv
     pull_policy: always
     # # Use this if wanting to build
     # build:

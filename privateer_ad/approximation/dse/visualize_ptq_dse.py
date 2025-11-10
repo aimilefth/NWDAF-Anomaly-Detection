@@ -20,6 +20,7 @@ DEFAULT_TARGET_METRICS = [
     "approx_f1-score",
     "anomaly_score_abs_diff_mean",
     "approx_roc_auc",
+    "attack_success_rate_eps_0.1",
 ]
 
 
