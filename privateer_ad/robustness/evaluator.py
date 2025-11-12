@@ -19,6 +19,8 @@ def evaluate_robustness(
     dataloader: DataLoader,
     threshold: float,
     epsilons: List[float],
+    eps_step: float,
+    max_iter: int,
     device: str,
 ) -> Dict[str, float]:
     """
@@ -43,7 +45,7 @@ def evaluate_robustness(
 
         # Create a new attacker for each epsilon value
         attacker = create_adversarial_attacker(
-            model, model_config, threshold, eps, max_iter=250, device=device, batch_size=batch_size
+            model, model_config, threshold, eps, eps_step=eps_step, max_iter=max_iter, device=device, batch_size=batch_size
         )
 
         for batch in tqdm(dataloader, desc=f"Attacking with eps={eps}"):

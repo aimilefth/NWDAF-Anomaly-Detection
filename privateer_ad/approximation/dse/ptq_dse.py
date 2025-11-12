@@ -64,16 +64,21 @@ def ptq_dse():
     THRESHOLD = 0.0209596287459135
 
     # --- DSE Grid Parameters ---
-    weight_bits_options = [16, 14, 12, 10, 8, 6, 4]
-    activation_bits_options = [16, 14, 12, 10, 8, 6, 4]
+    weight_bits_options = [16, 14, 12, 10]
+    activation_bits_options = [16, 14, 12, 10]
     weight_quant_type_options = ["min_mse"]
     calibration_type_options = ["min_mse"]
     test_batch_size = 2048
     calibration_batch_size = 131072
 
+    # --- Robustness Parameters ---
+    EPSILONS = [0.01]
+    EPS_STEP = 0.0005
+    MAX_ITER = 100
+
     # --- DSE Setup ---
     mlflow.set_tracking_uri(MLFLOW_CONFIG.tracking_uri)
-    mlflow.set_experiment(f"PTQ_DSE_{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+    mlflow.set_experiment(f"PTQ_DSE_ADV_{datetime.now().strftime('%Y%m%d-%H%M%S')}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -112,7 +117,9 @@ def ptq_dse():
         model_config=PRETRAINED_MODEL_CONFIG,
         dataloader=test_dl,
         threshold=THRESHOLD,
-        epsilons=[0.1],
+        epsilons=EPSILONS,
+        eps_step=EPS_STEP,
+        max_iter=MAX_ITER,
         device=device,
     )
     logging.info(f"Golden model robustness pre-calculated: {calculated_golden_robustness}")
@@ -180,6 +187,7 @@ def ptq_dse():
             device=device,
             check_robustness_approx=True,
             check_robustness_golden=True,
+            epsilons=EPSILONS,
             calculated_golden=calculated_golden,
             calculated_golden_robustness=calculated_golden_robustness,
         )

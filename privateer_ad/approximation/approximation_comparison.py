@@ -193,6 +193,9 @@ def approximation_comparison_mlflow(
     loss_fn_name: str = "L1Loss",
     check_robustness_approx: bool = False,
     check_robustness_golden: bool = False,
+    epsilons: List[float] = [0.01],
+    eps_step: float = 0.0005,
+    max_iter: int = 100,
     calculated_golden: Optional[Tuple] = None,
     calculated_golden_robustness: Optional[Dict] = None,
 ) -> Dict[str, Any]:
@@ -226,8 +229,12 @@ def approximation_comparison_mlflow(
         mlflow.log_metrics(result["approx"]["metrics"])
         mlflow.log_metrics(result["comparison"]["summary"])
 
-        # Golden Robustness Evaluation
+        # Robustness Evaluation
         if check_robustness_golden:
+            mlflow.log_param("robustness_epsilons", str(epsilons))
+            mlflow.log_param("robustness_eps_step", eps_step)
+            mlflow.log_param("robustness_max_iter", max_iter)
+            # Golden Robustness Evaluation
             if calculated_golden_robustness:
                 robustness_metrics_golden = calculated_golden_robustness
                 logging.info("Using pre-calculated golden robustness metrics.")
@@ -238,26 +245,30 @@ def approximation_comparison_mlflow(
                     model_config=ModelConfig(),
                     dataloader=dataloader,
                     threshold=threshold,
-                    epsilons=[0.1],
+                    epsilons=epsilons,
+                    eps_step=eps_step,
+                    max_iter=max_iter,
                     device=device,
                 )
             mlflow.log_metrics({f"golden_{k}": v for k, v in robustness_metrics_golden.items()})
             result["golden_robustness_metrics"] = robustness_metrics_golden
 
-        # Approximated Model Robustness Evaluation
-        if check_robustness_approx and not isinstance(approximated, AlveoRunner):
-            logging.info("Checking adversarial robustness for approximated model...")
-            robustness_metrics_approx = evaluate_robustness(
-                model=approximated,
-                model_config=ModelConfig(),
-                dataloader=dataloader,
-                threshold=threshold,
-                epsilons=[0.1],
-                device=device,
-            )
-            mlflow.log_metrics({f"approx_{k}": v for k, v in robustness_metrics_approx.items()})
-            logging.info(f"Approx robustness metrics: {robustness_metrics_approx}")
-            result["approx_robustness_metrics"] = robustness_metrics_approx
+            # Approximated Model Robustness Evaluation
+            if not isinstance(approximated, AlveoRunner):
+                logging.info("Checking adversarial robustness for approximated model...")
+                robustness_metrics_approx = evaluate_robustness(
+                    model=approximated,
+                    model_config=ModelConfig(),
+                    dataloader=dataloader,
+                    threshold=threshold,
+                    epsilons=epsilons,
+                    eps_step=eps_step,
+                    max_iter=max_iter,
+                    device=device,
+                )
+                mlflow.log_metrics({f"approx_{k}": v for k, v in robustness_metrics_approx.items()})
+                logging.info(f"Approx robustness metrics: {robustness_metrics_approx}")
+                result["approx_robustness_metrics"] = robustness_metrics_approx
 
         # Log all figures.
         for name, fig in result["golden"]["figures"].items():

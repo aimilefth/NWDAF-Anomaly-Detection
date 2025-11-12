@@ -43,10 +43,11 @@ def create_adversarial_attacker(
     model: nn.Module,
     model_config: ModelConfig,
     threshold: float,
-    eps: float,
-    max_iter: int,
-    device: str,
-    batch_size: int,
+    eps: float = 0.01,
+    eps_step: float = 0.0005,
+    max_iter: int = 100,
+    device: str = 'cpu',
+    batch_size: int = 4096,
 ) -> ProjectedGradientDescentPyTorch:
     """
     Creates and configures a Projected Gradient Descent (PGD) attacker from the ART library.
@@ -74,7 +75,7 @@ def create_adversarial_attacker(
     return ProjectedGradientDescentPyTorch(
         art_classifier,
         eps=eps,
-        eps_step=.0005,
+        eps_step=eps_step,
         norm="inf",
         max_iter=max_iter,
         targeted=True,
