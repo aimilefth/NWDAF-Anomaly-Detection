@@ -208,40 +208,50 @@ class ModelTrainer:
         # Split benign and malicious samples
         benign_y_scores = y_score[y_true == 0]
         malicious_y_scores = y_score[y_true == 1]
-        # get min number of samples per class
-        n_samples_per_class = min(map(len, [benign_y_scores, malicious_y_scores]))
-        n_benign_y_scores = self.rng.permutation(x=benign_y_scores, axis=0)[:n_samples_per_class]
-        n_malicious_y_scores = self.rng.permutation(x=malicious_y_scores, axis=0)[:n_samples_per_class]
-        # shuffle and select min number of samples per class
 
-        # concatenate benign and malicious samples to get balanced dataset
-        balanced_y_scores = np.concatenate([n_benign_y_scores, n_malicious_y_scores])
-        balanced_y_true = np.concatenate([np.zeros(n_samples_per_class, dtype=np.int32),
-                                             np.ones(n_samples_per_class, dtype=np.int32)])
 
-        balanced_y_scores = balanced_y_scores
-        balanced_y_true = balanced_y_true
-        # Compute threshold from balanced data samples
-        fpr, tpr, thresholds = roc_curve(y_true=balanced_y_true, y_score=balanced_y_scores)
-        optimal_idx = np.argmin(np.sqrt(np.power(fpr, 2) + np.power(1 - tpr, 2)))
-        threshold = thresholds[optimal_idx]
+               # --- START OF THE FIX ---
+        # Check if both classes (0 and 1) are present in the validation set
+        if len(malicious_y_scores) == 0:
+            logging.warning("Validation set contains only benign. Skipping ROC and classification metrics.")
+            # We can only report the loss. The other metrics are undefined.
+            report_dict = {'loss': np.mean(y_score)}
+            report_dict['threshold'] = 0.0
+            report_dict['f1-score'] = 0.0 # Provide a default value
+            report_dict['roc_auc'] = 0.5 # A random classifier's AUC
+        else:
+            # get min number of samples per class
+            n_samples_per_class = min(map(len, [benign_y_scores, malicious_y_scores]))
+            n_benign_y_scores = self.rng.permutation(x=benign_y_scores, axis=0)[:n_samples_per_class]
+            n_malicious_y_scores = self.rng.permutation(x=malicious_y_scores, axis=0)[:n_samples_per_class]
+            # shuffle and select min number of samples per class
 
-        # Compute metrics
-        metrics = self.calculate_metrics(rec_errors=y_score,
-                                         y_true=y_true,
-                                         threshold=threshold,
-                                         target_names=target_names,
-                                         prefix='')
-        balanced_metrics = self.calculate_metrics(rec_errors=balanced_y_scores,
-                                                  y_true=balanced_y_true,
-                                                  threshold=threshold,
-                                                  target_names=target_names,
-                                                  prefix='balanced')
+            # concatenate benign and malicious samples to get balanced dataset
+            balanced_y_scores = np.concatenate([n_benign_y_scores, n_malicious_y_scores])
+            balanced_y_true = np.concatenate([np.zeros(n_samples_per_class, dtype=np.int32),
+                                                    np.ones(n_samples_per_class, dtype=np.int32)])
+            balanced_y_scores = balanced_y_scores
+            balanced_y_true = balanced_y_true
+            # Compute threshold from balanced data samples
+            fpr, tpr, thresholds = roc_curve(y_true=balanced_y_true, y_score=balanced_y_scores)
+            optimal_idx = np.argmin(np.sqrt(np.power(fpr, 2) + np.power(1 - tpr, 2)))
+            threshold = thresholds[optimal_idx]
 
-        report_dict = {'loss': np.mean(y_score),
-                       'threshold': float(threshold)}
+            # Compute metrics
+            metrics = self.calculate_metrics(rec_errors=y_score,
+                                            y_true=y_true,
+                                            threshold=threshold,
+                                            target_names=target_names,
+                                            prefix='')
+            balanced_metrics = self.calculate_metrics(rec_errors=balanced_y_scores,
+                                                    y_true=balanced_y_true,
+                                                    threshold=threshold,
+                                                    target_names=target_names,
+                                                    prefix='balanced')
+            report_dict = {'loss': np.mean(y_score),
+                'threshold': float(threshold)}
 
-        report_dict |= metrics | balanced_metrics
+            report_dict |= metrics | balanced_metrics
         report_dict = {f'_'.join(['val', k]) :  v for k, v in report_dict.items()}
         return report_dict
 

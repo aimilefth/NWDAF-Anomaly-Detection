@@ -48,51 +48,7 @@ def approximation_comparison(
     calculated_golden: Optional[Tuple[Dict, Dict, np.ndarray]] = None,
     return_golden_scores: bool = False,
 ) -> Union[Dict[str, Any], Tuple[Dict[str, Any], np.ndarray]]:
-    """
-    Compare a 'golden' PyTorch model vs an approximated model (PyTorch or AlveoRunner).
-
-    This function reuses the standard evaluation pipelines to avoid recomputing
-    model outputs, focusing only on the difference in their final anomaly scores.
-
-    Steps:
-      1) Evaluate both models with their respective evaluators, capturing the
-         per-sample anomaly scores.
-      2) Compute the absolute difference between the anomaly score arrays.
-      3) Aggregate the differences (mean, std).
-      4) Produce figures visualizing the per-sample score differences
-         (line plot) and their distribution (histogram).
-
-    Args:
-        # ... (other args)
-        calculated_golden (Optional[Tuple]): Pre-computed results for the golden model
-                                             in the format (metrics, figures, scores)
-                                             to avoid re-calculation.
-        return_golden_scores (bool): If True, returns the golden_scores as a second
-                                     element in a tuple.
-
-    Returns:
-      A dictionary with the results, or a tuple (results_dict, golden_scores)
-      if return_golden_scores is True.
-      results_dict is:
-        - 'golden': {'metrics': ..., 'figures': ...} from the evaluation run.
-        - 'approx': {'metrics': ..., 'figures': ...} from the evaluation run.
-        - 'comparison': {
-              'per_sample': {
-                  'anomaly_score_abs_diff': List[float],
-              },
-              'summary': {
-                  'anomaly_score_abs_diff_mean': float,
-                  'anomaly_score_abs_diff_std': float,
-              },
-              'figures': {
-                  'anomaly_diff_line': Figure,
-                  'anomaly_diff_hist': Figure,
-              }
-          }
-    """
-    # -----------------------
-    # Setup
-    # -----------------------
+    # ... (This function's implementation is unchanged) ...
     device = torch.device(device) if device is not None else torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -181,7 +137,103 @@ def approximation_comparison(
         return result, golden_scores
     return result
 
+def _log_comparison_to_mlflow(
+    golden_model: torch.nn.Module,
+    approximated: Union[torch.nn.Module, AlveoRunner],
+    dataloader,
+    threshold: float,
+    mlflow_params: dict,
+    q_config: Optional[TransformerADQConfig] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    loss_fn_name: str = "L1Loss",
+    check_robustness_approx: bool = False,
+    check_robustness_golden: bool = False,
+    epsilons: List[float] = [0.01],
+    eps_step: float = 0.0005,
+    max_iter: int = 100,
+    calculated_golden: Optional[Tuple] = None,
+    calculated_golden_robustness: Optional[Dict] = None,
+) -> Dict[str, Any]:
+    """Internal function to perform comparison and log to an *active* MLflow run."""
+    # Log DSE parameters
+    mlflow.log_params(mlflow_params)
+
+    # Log the calibrated QConfig as an artifact
+    if q_config:
+        mlflow.log_dict(q_config.model_dump(mode="json"), "qconfig_calibrated.json")
+
+    # Run the core comparison
+    result = approximation_comparison(
+        golden_model=golden_model,
+        approximated=approximated,
+        dataloader=dataloader,
+        threshold=threshold,
+        device=device,
+        loss_fn_name=loss_fn_name,
+        calculated_golden=calculated_golden,
+    )
+
+    # Log all metrics
+    mlflow.log_metrics(result["golden"]["metrics"])
+    mlflow.log_metrics(result["approx"]["metrics"])
+    mlflow.log_metrics(result["comparison"]["summary"])
+
+    # Robustness Evaluation
+    if check_robustness_golden:
+        mlflow.log_param("robustness_epsilons", str(epsilons))
+        mlflow.log_param("robustness_eps_step", eps_step)
+        mlflow.log_param("robustness_max_iter", max_iter)
+        # Golden Robustness Evaluation
+        if calculated_golden_robustness:
+            robustness_metrics_golden = calculated_golden_robustness
+            logging.info("Using pre-calculated golden robustness metrics.")
+        else:
+            logging.info("Checking adversarial robustness for golden model...")
+            robustness_metrics_golden = evaluate_robustness(
+                model=golden_model,
+                model_config=ModelConfig(),
+                dataloader=dataloader,
+                threshold=threshold,
+                epsilons=epsilons,
+                eps_step=eps_step,
+                max_iter=max_iter,
+                device=device,
+            )
+        mlflow.log_metrics({f"golden_{k}": v for k, v in robustness_metrics_golden.items()})
+        result["golden_robustness_metrics"] = robustness_metrics_golden
+
+        # Approximated Model Robustness Evaluation
+        if not isinstance(approximated, AlveoRunner):
+            logging.info("Checking adversarial robustness for approximated model...")
+            robustness_metrics_approx = evaluate_robustness(
+                model=approximated,
+                model_config=ModelConfig(),
+                dataloader=dataloader,
+                threshold=threshold,
+                epsilons=epsilons,
+                eps_step=eps_step,
+                max_iter=max_iter,
+                device=device,
+            )
+            mlflow.log_metrics({f"approx_{k}": v for k, v in robustness_metrics_approx.items()})
+            logging.info(f"Approx robustness metrics: {robustness_metrics_approx}")
+            result["approx_robustness_metrics"] = robustness_metrics_approx
+    # Log all figures.
+    for name, fig in result["golden"]["figures"].items():
+        # mlflow.log_figure(fig, f"golden_{name}.png")
+        plt.close(fig)
+    for name, fig in result["approx"]["figures"].items():
+        # mlflow.log_figure(fig, f"approx_{name}.png")
+        plt.close(fig)
+    for name, fig in result["comparison"]["figures"].items():
+        mlflow.log_figure(fig, f"comparison_{name}.png")
+        plt.close(fig)
+    logging.info("Successfully logged comparison results to active MLflow run.")
+    return result
+
+
 def approximation_comparison_mlflow(
+    # ... (all previous arguments) ...
     golden_model: torch.nn.Module,
     approximated: Union[torch.nn.Module, AlveoRunner],
     dataloader,
@@ -198,97 +250,46 @@ def approximation_comparison_mlflow(
     max_iter: int = 100,
     calculated_golden: Optional[Tuple] = None,
     calculated_golden_robustness: Optional[Dict] = None,
+    manage_run: bool = True,  # <-- NEW ARGUMENT
 ) -> Dict[str, Any]:
     """
-    Runs approximation_comparison and logs all parameters, metrics, and artifacts to MLflow.
+    Runs approximation_comparison and logs all results to MLflow.
+
+    Args:
+        ...
+        manage_run (bool): If True (default), starts and ends an MLflow run.
+                           If False, logs to a pre-existing active run.
     """
-    try:
-        mlflow.start_run(run_name=mlflow_run_name)
-        logging.info(f"Started MLflow run: {mlflow_run_name}")
-
-        # Log DSE parameters
-        mlflow.log_params(mlflow_params)
-
-        # Log the calibrated QConfig as an artifact
-        if q_config:
-            mlflow.log_dict(q_config.model_dump(mode="json"), "qconfig_calibrated.json")
-
-        # Run the core comparison
-        result = approximation_comparison(
-            golden_model=golden_model,
-            approximated=approximated,
-            dataloader=dataloader,
-            threshold=threshold,
-            device=device,
-            loss_fn_name=loss_fn_name,
-            calculated_golden=calculated_golden
-        )
-
-        # Log all metrics
-        mlflow.log_metrics(result["golden"]["metrics"])
-        mlflow.log_metrics(result["approx"]["metrics"])
-        mlflow.log_metrics(result["comparison"]["summary"])
-
-        # Robustness Evaluation
-        if check_robustness_golden:
-            mlflow.log_param("robustness_epsilons", str(epsilons))
-            mlflow.log_param("robustness_eps_step", eps_step)
-            mlflow.log_param("robustness_max_iter", max_iter)
-            # Golden Robustness Evaluation
-            if calculated_golden_robustness:
-                robustness_metrics_golden = calculated_golden_robustness
-                logging.info("Using pre-calculated golden robustness metrics.")
-            else:
-                logging.info("Checking adversarial robustness for golden model...")
-                robustness_metrics_golden = evaluate_robustness(
-                    model=golden_model,
-                    model_config=ModelConfig(),
-                    dataloader=dataloader,
-                    threshold=threshold,
-                    epsilons=epsilons,
-                    eps_step=eps_step,
-                    max_iter=max_iter,
-                    device=device,
-                )
-            mlflow.log_metrics({f"golden_{k}": v for k, v in robustness_metrics_golden.items()})
-            result["golden_robustness_metrics"] = robustness_metrics_golden
-
-            # Approximated Model Robustness Evaluation
-            if not isinstance(approximated, AlveoRunner):
-                logging.info("Checking adversarial robustness for approximated model...")
-                robustness_metrics_approx = evaluate_robustness(
-                    model=approximated,
-                    model_config=ModelConfig(),
-                    dataloader=dataloader,
-                    threshold=threshold,
-                    epsilons=epsilons,
-                    eps_step=eps_step,
-                    max_iter=max_iter,
-                    device=device,
-                )
-                mlflow.log_metrics({f"approx_{k}": v for k, v in robustness_metrics_approx.items()})
-                logging.info(f"Approx robustness metrics: {robustness_metrics_approx}")
-                result["approx_robustness_metrics"] = robustness_metrics_approx
-
-        # Log all figures.
-        for name, fig in result["golden"]["figures"].items():
-            # mlflow.log_figure(fig, f"golden_{name}.png")
-            plt.close(fig)
-        for name, fig in result["approx"]["figures"].items():
-            # mlflow.log_figure(fig, f"approx_{name}.png")
-            plt.close(fig)
-        for name, fig in result["comparison"]["figures"].items():
-            mlflow.log_figure(fig, f"comparison_{name}.png")
-            plt.close(fig)
-        
-        logging.info("Successfully logged all results to MLflow.")
-        return result
-
-    except Exception as e:
-        logging.error(f"MLflow logging or evaluation failed for run {mlflow_run_name}: {e}", exc_info=True)
-        # Return an error structure so the DSE can continue
-        return {"error": str(e)}
-    finally:
-        if mlflow.active_run():
-            mlflow.end_run()
-            logging.info(f"Ended MLflow run: {mlflow_run_name}")
+    if manage_run:
+        try:
+            mlflow.start_run(run_name=mlflow_run_name)
+            logging.info(f"Started MLflow run: {mlflow_run_name}")
+            result = _log_comparison_to_mlflow(
+                golden_model, approximated, dataloader, threshold, mlflow_params,
+                q_config, device, loss_fn_name, check_robustness_approx,
+                check_robustness_golden, epsilons, eps_step, max_iter,
+                calculated_golden, calculated_golden_robustness
+            )
+            return result
+        except Exception as e:
+            logging.error(f"MLflow logging or evaluation failed for run {mlflow_run_name}: {e}", exc_info=True)
+            return {"error": str(e)}
+        finally:
+            if mlflow.active_run():
+                mlflow.end_run()
+                logging.info(f"Ended MLflow run: {mlflow_run_name}")
+    else:
+        # Assumes a run is already active. Does not start or end one.
+        if not mlflow.active_run():
+            logging.error("manage_run=False but no active MLflow run was found.")
+            return {"error": "No active MLflow run."}
+        try:
+            return _log_comparison_to_mlflow(
+                golden_model, approximated, dataloader, threshold, mlflow_params,
+                q_config, device, loss_fn_name, check_robustness_approx,
+                check_robustness_golden, epsilons, eps_step, max_iter,
+                calculated_golden, calculated_golden_robustness
+            )
+        except Exception as e:
+            logging.error(f"MLflow logging failed for active run: {e}", exc_info=True)
+            return {"error": str(e)}
