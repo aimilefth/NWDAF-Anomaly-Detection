@@ -184,15 +184,22 @@ def qat_dse(adversarial_training: bool = False):
             approximated_model.load_state_dict(state_dict)
             approximated_model.to(device)
 
-            # 2. Calibrate activations
-            logging.info("Calibrating model activations...")
-            approximated_model.set_no_overflow_quant() # Initialize weight quantization
+                # 2. Apply PTQ
+            logging.info("Applying post-training quantization...")
+            if w_q_type == "no_overflow":
+                approximated_model.set_no_overflow_quant()
+            elif w_q_type == "min_mse":
+                approximated_model.set_min_mse_quant()
+
+            # 3. Calibrate
+            logging.info(f"Calibrating with {calibration_real_batch_size} samples...")
             with torch.no_grad():
-                _ = approximated_model(calibration_input, calibrate=True, calibration_type="no_overflow")
+                _ = approximated_model(calibration_input, calibrate=True, calibration_type=cal_type)
+            logging.info("Calibration finished.")
             
-            # 3. Perform Quantization-Aware Training (Fine-tuning)
+            # 4. Perform Quantization-Aware Training (Fine-tuning)
             logging.info(f"Starting QAT for {qat_epochs} epochs...")
-            qat_training_config = TrainingConfig(epochs=qat_epochs, learning_rate=1e-5, es_enabled=False)
+            qat_training_config = TrainingConfig(epochs=qat_epochs, target_metric='val_loss', direction='minimize')
             optimizer = torch.optim.Adam(approximated_model.parameters(), lr=qat_training_config.learning_rate)
             
             trainer = ModelTrainer(
@@ -223,7 +230,9 @@ def qat_dse(adversarial_training: bool = False):
                 device=device,
                 check_robustness_approx=True,
                 check_robustness_golden=True,
-                epsilons=ROBUSTNESS_EPSILONS,
+                epsilons=EV_EPSILONS,
+                eps_step=EV_EPS_STEP,
+                max_iter=EV_MAX_ITER,
                 calculated_golden=calculated_golden,
                 calculated_golden_robustness=calculated_golden_robustness,
                 manage_run=False # <--- THIS IS THE KEY CHANGE
