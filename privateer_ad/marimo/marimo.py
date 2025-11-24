@@ -2,7 +2,7 @@
 
 import marimo
 
-__generated_with = "0.17.7"
+__generated_with = "0.15.2"
 app = marimo.App(width="medium")
 
 
@@ -134,7 +134,7 @@ def _(
     os,
 ):
     mo.md("### 4) Create Alveo runner")
-    XCLBIN_PATH = os.path.join(PATHS.experiments_dir, "alveo_xclbins", "attention_ae_adv_W32A32_v2.xclbin")
+    XCLBIN_PATH = os.path.join(PATHS.experiments_dir, "alveo_xclbins", "attention_ae_adv_W16A16.xclbin")
 
     # Bus can be None if you only want overlay + kernel (no power scraping)
     DEVICE_BUS = None  # e.g. "0000:af:00.1"
@@ -256,6 +256,7 @@ def _(
     cuda_device,
     fxp_model,
     mo,
+    runner,
     test_dl,
 ):
     mo.md("### 8) Golden vs Approximated: Comparison Runs")
@@ -273,43 +274,42 @@ def _(
         loss_fn_name=loss_fn,
     )
 
-    # # --- 8.2: Golden (Float) vs Approximated (Alveo W32A32) ---
-    # mo.md("#### 8.2) Golden (Float) vs. Approximated (Alveo W32A32)")
-    # result_float_vs_alveo = approximation_comparison(
-    #     golden_model=adv_model,
-    #     approximated=runner,
-    #     dataloader=test_dl,
-    #     threshold=THRESHOLD,
-    #     device=cuda_device,
-    #     loss_fn_name=loss_fn,
-    # )
+    # --- 8.2: Golden (Float) vs Approximated (Alveo W16A16) ---
+    mo.md("#### 8.2) Golden (Float) vs. Approximated (Alveo W16A16)")
+    result_float_vs_alveo = approximation_comparison(
+        golden_model=adv_model,
+        approximated=runner,
+        dataloader=test_dl,
+        threshold=THRESHOLD,
+        device=cuda_device,
+        loss_fn_name=loss_fn,
+    )
 
-    # # --- 8.3: Golden (FxP W32A32) vs Approximated (Alveo W32A32) ---
-    # mo.md("#### 8.3) Golden (FxP W32A32) vs. Approximated (Alveo W32A32)")
-    # result_fxp_vs_alveo = approximation_comparison(
-    #     golden_model=fxp_model,
-    #     approximated=runner,
-    #     dataloader=test_dl,
-    #     threshold=THRESHOLD,
-    #     device=cuda_device,
-    #     loss_fn_name=loss_fn,
-    # )
+    # --- 8.3: Golden (FxP W16A16) vs Approximated (Alveo W16A16) ---
+    mo.md("#### 8.3) Golden (FxP W16A16) vs. Approximated (Alveo W16A16)")
+    result_fxp_vs_alveo = approximation_comparison(
+        golden_model=fxp_model,
+        approximated=runner,
+        dataloader=test_dl,
+        threshold=THRESHOLD,
+        device=cuda_device,
+        loss_fn_name=loss_fn,
+    )
 
     # Display summaries
     print("--- Summary: Float vs FxP ---")
     print({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in result_float_vs_fxp["comparison"]["summary"].items()})
-    # print("\n--- Summary: Float vs Alveo ---")
-    # print({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in result_float_vs_alveo["comparison"]["summary"].items()})
-    # print("\n--- Summary: FxP vs Alveo ---")
-    # print({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in result_fxp_vs_alveo["comparison"]["summary"].items()})
-    return (result_float_vs_fxp,)
+    print("\n--- Summary: Float vs Alveo ---")
+    print({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in result_float_vs_alveo["comparison"]["summary"].items()})
+    print("\n--- Summary: FxP vs Alveo ---")
+    print({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in result_fxp_vs_alveo["comparison"]["summary"].items()})
+    return result_float_vs_alveo, result_float_vs_fxp, result_fxp_vs_alveo
 
 
 @app.cell
-def _(mo, result_float_vs_fxp):
+def _(mo, result_float_vs_alveo, result_float_vs_fxp, result_fxp_vs_alveo):
     mo.md("### 9) Comparison Figures")
-    result_float_vs_fxp['comparison']['figures'],
-    # result_float_vs_fxp['comparison']['figures'],  result_float_vs_alveo['comparison']['figures'], result_fxp_vs_alveo['comparison']['figures'], 
+    result_float_vs_fxp['comparison']['figures'],  result_float_vs_alveo['comparison']['figures'], result_fxp_vs_alveo['comparison']['figures'], 
     return
 
 
