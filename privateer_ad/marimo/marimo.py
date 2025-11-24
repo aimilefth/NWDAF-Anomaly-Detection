@@ -2,7 +2,7 @@
 
 import marimo
 
-__generated_with = "0.15.2"
+__generated_with = "0.17.7"
 app = marimo.App(width="medium")
 
 
@@ -209,22 +209,22 @@ def _(
     torch,
     val_dl,
 ):
-    mo.md("### 6) Create FxPTransformerAD Model (W32A32)")
+    mo.md("### 6) Create FxPTransformerAD Model (W16A16)")
 
     # 1. Define QConfig for 32-bit weights and activations
-    w32a32_qconfig = create_dynamic_qconfig(weight_bits=32, activation_bits=32)
+    w16a16_qconfig = create_dynamic_qconfig(weight_bits=16, activation_bits=16)
 
     # 2. Instantiate FxP model
     # Use the same base config as the floating point model
     fxp_model_config = FxPTransformerADConfig(**adv_model_config.model_dump())
-    fxp_model = FxpTransformerAD(config=fxp_model_config, q_config=w32a32_qconfig)
+    fxp_model = FxpTransformerAD(config=fxp_model_config, q_config=w16a16_qconfig)
 
     # 3. Load weights from the pre-trained float model
     fxp_model.load_state_dict(state_dict)
     fxp_model.to(cuda_device)
     fxp_model.eval()
 
-    print("Successfully instantiated FxpTransformerAD (W32A32) and loaded weights.")
+    print("Successfully instantiated FxpTransformerAD (W16A16) and loaded weights.")
 
     # 3. Calibrate the FxP Model"
 
@@ -234,17 +234,17 @@ def _(
     print(f"Using one batch of validation data for calibration. Shape: {calibration_input.shape}")
 
     # b. Set weight quantization based on their values (no-overflow)
-    fxp_model.set_no_overflow_quant()
-    print("Set no-overflow fractional bits for weights.")
+    fxp_model.set_min_mse_quant()
+    print("Set min_mse fractional bits for weights.")
 
     # c. Run calibration pass to set activation quantization
     with torch.no_grad():
-        _ = fxp_model(calibration_input, calibrate=True, calibration_type="no_overflow")
+        _ = fxp_model(calibration_input, calibrate=True, calibration_type="min_mse")
     print("Ran calibration pass for activations.")
 
     # d. Permanently quantize weights and biases
-    #fxp_model.quantize_weights_bias()
-    #print("Permanently quantized model weights and biases.")
+    # fxp_model.quantize_weights_bias()
+    # print("Permanently quantized model weights and biases.")
     return calibration_input, fxp_model
 
 
@@ -256,15 +256,14 @@ def _(
     cuda_device,
     fxp_model,
     mo,
-    runner,
     test_dl,
 ):
     mo.md("### 8) Golden vs Approximated: Comparison Runs")
 
     loss_fn = "L1Loss"
 
-    # --- 8.1: Golden (Float) vs Approximated (FxP W32A32) ---
-    mo.md("#### 8.1) Golden (Float) vs. Approximated (FxP W32A32)")
+    # --- 8.1: Golden (Float) vs Approximated (FxP W16A16) ---
+    mo.md("#### 8.1) Golden (Float) vs. Approximated (FxP W16A16)")
     result_float_vs_fxp = approximation_comparison(
         golden_model=adv_model,
         approximated=fxp_model,
@@ -274,43 +273,43 @@ def _(
         loss_fn_name=loss_fn,
     )
 
-    # --- 8.2: Golden (Float) vs Approximated (Alveo W32A32) ---
-    mo.md("#### 8.2) Golden (Float) vs. Approximated (Alveo W32A32)")
-    result_float_vs_alveo = approximation_comparison(
-        golden_model=adv_model,
-        approximated=runner,
-        dataloader=test_dl,
-        threshold=THRESHOLD,
-        device=cuda_device,
-        loss_fn_name=loss_fn,
-    )
+    # # --- 8.2: Golden (Float) vs Approximated (Alveo W32A32) ---
+    # mo.md("#### 8.2) Golden (Float) vs. Approximated (Alveo W32A32)")
+    # result_float_vs_alveo = approximation_comparison(
+    #     golden_model=adv_model,
+    #     approximated=runner,
+    #     dataloader=test_dl,
+    #     threshold=THRESHOLD,
+    #     device=cuda_device,
+    #     loss_fn_name=loss_fn,
+    # )
 
-    # --- 8.3: Golden (FxP W32A32) vs Approximated (Alveo W32A32) ---
-    mo.md("#### 8.3) Golden (FxP W32A32) vs. Approximated (Alveo W32A32)")
-    result_fxp_vs_alveo = approximation_comparison(
-        golden_model=fxp_model,
-        approximated=runner,
-        dataloader=test_dl,
-        threshold=THRESHOLD,
-        device=cuda_device,
-        loss_fn_name=loss_fn,
-    )
+    # # --- 8.3: Golden (FxP W32A32) vs Approximated (Alveo W32A32) ---
+    # mo.md("#### 8.3) Golden (FxP W32A32) vs. Approximated (Alveo W32A32)")
+    # result_fxp_vs_alveo = approximation_comparison(
+    #     golden_model=fxp_model,
+    #     approximated=runner,
+    #     dataloader=test_dl,
+    #     threshold=THRESHOLD,
+    #     device=cuda_device,
+    #     loss_fn_name=loss_fn,
+    # )
 
     # Display summaries
     print("--- Summary: Float vs FxP ---")
     print({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in result_float_vs_fxp["comparison"]["summary"].items()})
-    print("\n--- Summary: Float vs Alveo ---")
-    print({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in result_float_vs_alveo["comparison"]["summary"].items()})
-    print("\n--- Summary: FxP vs Alveo ---")
-    print({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in result_fxp_vs_alveo["comparison"]["summary"].items()})
-    return result_float_vs_alveo, result_float_vs_fxp, result_fxp_vs_alveo
+    # print("\n--- Summary: Float vs Alveo ---")
+    # print({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in result_float_vs_alveo["comparison"]["summary"].items()})
+    # print("\n--- Summary: FxP vs Alveo ---")
+    # print({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in result_fxp_vs_alveo["comparison"]["summary"].items()})
+    return (result_float_vs_fxp,)
 
 
 @app.cell
-def _(mo, result_float_vs_alveo, result_float_vs_fxp, result_fxp_vs_alveo):
+def _(mo, result_float_vs_fxp):
     mo.md("### 9) Comparison Figures")
-
-    result_float_vs_fxp['comparison']['figures'],  result_float_vs_alveo['comparison']['figures'], result_fxp_vs_alveo['comparison']['figures'], 
+    result_float_vs_fxp['comparison']['figures'],
+    # result_float_vs_fxp['comparison']['figures'],  result_float_vs_alveo['comparison']['figures'], result_fxp_vs_alveo['comparison']['figures'], 
     return
 
 
@@ -330,31 +329,31 @@ def _(calibration_input, fxp_model, mo, os):
             post_process_header_for_specific_types,
         )
 
-    OUTPUT_DIR = os.path.join("app", "outputs", "fxp_w32a32_2")
+    OUTPUT_DIR = os.path.join("app", "outputs", "fxp_w16a16_no_w_quant")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # Save the final, calibrated qconfig for inspection
-    qconfig_w32_a32_path = os.path.join(
-        OUTPUT_DIR, "adv_model_w32_a32_qconfig.json"
+    qconfig_w16_a16_path = os.path.join(
+        OUTPUT_DIR, "adv_model_w16_a16_qconfig.json"
     )
-    with open(qconfig_w32_a32_path, "w") as f:
+    with open(qconfig_w16_a16_path, "w") as f:
         f.write(fxp_model.q_config.model_dump_json(indent=2))
-    print(f"\nSaved calibrated QConfig to {qconfig_w32_a32_path}")
+    print(f"\nSaved calibrated QConfig to {qconfig_w16_a16_path}")
 
     # Export weights to JSON and H files
-    json_path_w32_a32 = os.path.join(OUTPUT_DIR , "adv_model_w32_a32.json")
-    h_path_w32_a32 = os.path.join(OUTPUT_DIR , "adv_model_w32_a32.h")
+    json_path_w16_a16 = os.path.join(OUTPUT_DIR , "adv_model_w16_a16.json")
+    h_path_w16_a16 = os.path.join(OUTPUT_DIR , "adv_model_w16_a16.h")
 
     print(
-        f"\nExporting float model weights to {json_path_w32_a32} and {h_path_w32_a32}..."
+        f"\nExporting float model weights to {json_path_w16_a16} and {h_path_w16_a16}..."
     )
     convert_model_to_json_ae(
         fxp_model,
-        filename=json_path_w32_a32,
+        filename=json_path_w16_a16,
         input_shape=calibration_input.shape,
     )
-    convert_json_to_h_ae(json_filename=json_path_w32_a32, h_filename=h_path_w32_a32)
-    post_process_header_for_specific_types(h_filename=h_path_w32_a32)
+    convert_json_to_h_ae(json_filename=json_path_w16_a16, h_filename=h_path_w16_a16)
+    post_process_header_for_specific_types(h_filename=h_path_w16_a16)
     return
 
 
