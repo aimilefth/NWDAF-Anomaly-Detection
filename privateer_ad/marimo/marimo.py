@@ -252,6 +252,7 @@ def _(
 def _(
     THRESHOLD,
     adv_model,
+    adv_model_config,
     approximation_comparison,
     cuda_device,
     fxp_model,
@@ -261,21 +262,18 @@ def _(
 ):
     mo.md("### 8) Golden vs Approximated: Comparison Runs")
 
+    import pandas as pd
+    from privateer_ad.robustness.evaluator import evaluate_robustness, evaluate_robustness_alveo
+    from privateer_ad.robustness.adversarial_dataloader import create_adversarial_dataloader
+
     loss_fn = "L1Loss"
 
-    # --- 8.1: Golden (Float) vs Approximated (FxP W16A16) ---
-    mo.md("#### 8.1) Golden (Float) vs. Approximated (FxP W16A16)")
-    result_float_vs_fxp = approximation_comparison(
-        golden_model=adv_model,
-        approximated=fxp_model,
-        dataloader=test_dl,
-        threshold=THRESHOLD,
-        device=cuda_device,
-        loss_fn_name=loss_fn,
-    )
+    # Robustness settings
+    ROBUSTNESS_EPS = 0.01
+    ROBUSTNESS_STEPS = 100 # Iterations for PGD attack
 
-    # --- 8.2: Golden (Float) vs Approximated (Alveo W16A16) ---
-    mo.md("#### 8.2) Golden (Float) vs. Approximated (Alveo W16A16)")
+    # --- 8.1: Run Standard Comparison (Float vs Alveo) ---
+    print("1. Running Standard Evaluation (Clean Data)...")
     result_float_vs_alveo = approximation_comparison(
         golden_model=adv_model,
         approximated=runner,
@@ -285,31 +283,174 @@ def _(
         loss_fn_name=loss_fn,
     )
 
-    # --- 8.3: Golden (FxP W16A16) vs Approximated (Alveo W16A16) ---
-    mo.md("#### 8.3) Golden (FxP W16A16) vs. Approximated (Alveo W16A16)")
-    result_fxp_vs_alveo = approximation_comparison(
-        golden_model=fxp_model,
-        approximated=runner,
+    # --- 8.2: Evaluate Robustness for Golden (Float) Model ---
+    print("\n2. Evaluating Golden Model Robustness...")
+    robustness_golden = evaluate_robustness(
+        model=adv_model,
+        model_config=adv_model_config,
         dataloader=test_dl,
         threshold=THRESHOLD,
-        device=cuda_device,
-        loss_fn_name=loss_fn,
+        epsilons=[ROBUSTNESS_EPS],
+        eps_step=0.0005,
+        max_iter=ROBUSTNESS_STEPS,
+        device=cuda_device
+    )
+    # Prefix metrics
+    for k, v in robustness_golden.items():
+        result_float_vs_alveo['golden']['metrics'][f"golden_{k}"] = v
+
+    # --- 8.3: Evaluate Robustness for Alveo Model ---
+    print("\n3. Evaluating Alveo Model Robustness...")
+    robustness_alveo = evaluate_robustness_alveo(
+        runner=runner,
+        proxy_model=fxp_model, # Use FxP model for gradients
+        model_config=adv_model_config,
+        dataloader=test_dl,
+        threshold=THRESHOLD,
+        epsilons=[ROBUSTNESS_EPS],
+        eps_step=0.0005,
+        max_iter=ROBUSTNESS_STEPS,
+        device=cuda_device
     )
 
-    # Display summaries
-    print("--- Summary: Float vs FxP ---")
-    print({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in result_float_vs_fxp["comparison"]["summary"].items()})
-    print("\n--- Summary: Float vs Alveo ---")
-    print({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in result_float_vs_alveo["comparison"]["summary"].items()})
-    print("\n--- Summary: FxP vs Alveo ---")
-    print({k: (f"{v:.6f}" if isinstance(v, float) else v) for k, v in result_fxp_vs_alveo["comparison"]["summary"].items()})
-    return result_float_vs_alveo, result_float_vs_fxp, result_fxp_vs_alveo
+    # Prefix metrics
+    for k, v in robustness_alveo.items():
+        # Map generic key to specific approx key
+        result_float_vs_alveo['approx']['metrics'][f"approx_{k}"] = v
+
+    # --- 8.4: Pretty Print Summary Table ---
+    print("\n" + "="*80)
+    print(f"{'COMPARISON SUMMARY':^80}")
+    print("="*80)
+
+    g_metrics = result_float_vs_alveo['golden']['metrics']
+    a_metrics = result_float_vs_alveo['approx']['metrics']
+
+    metric_map = {
+        'ROC AUC': 'roc_auc',
+        'Loss (L1)': 'loss',
+        'Precision': 'precision',
+        'Recall': 'recall',
+        'F1-Score': 'f1-score',
+        f'Robustness (ASR @ {ROBUSTNESS_EPS})': f'attack_success_rate_eps_{ROBUSTNESS_EPS}'
+    }
+
+    table_data = []
+    for display_name, base_key in metric_map.items():
+        g_key = f"golden_{base_key}"
+        a_key = f"approx_{base_key}"
+    
+        g_val = g_metrics.get(g_key, 0.0)
+        a_val = a_metrics.get(a_key, 0.0)
+        diff = a_val - g_val
+    
+        table_data.append({
+            "Metric": display_name,
+            "Golden (Float)": g_val,
+            "Approx (Alveo)": a_val,
+            "Diff": diff
+        })
+
+    df_res = pd.DataFrame(table_data)
+
+    format_mapping = {
+        "Golden (Float)": "{:,.4f}", 
+        "Approx (Alveo)": "{:,.4f}", 
+        "Diff": "{:+,.4f}"
+    }
+
+    print(df_res.to_string(index=False, formatters={
+        k: v.format for k, v in format_mapping.items()
+    }))
+    print("-" * 80)
+
+    print("\nPer-Sample Difference Summary:")
+    print(pd.Series(result_float_vs_alveo['comparison']['summary']).to_string())
+    return (result_float_vs_alveo,)
+
+
+@app.cell
+def _(result_float_vs_alveo):
+    print(result_float_vs_alveo['golden'])
+    print(result_float_vs_alveo['approx'])
+    print(result_float_vs_alveo['comparison']['summary'])
+    return
 
 
 @app.cell
 def _(mo, result_float_vs_alveo, result_float_vs_fxp, result_fxp_vs_alveo):
     mo.md("### 9) Comparison Figures")
     result_float_vs_fxp['comparison']['figures'],  result_float_vs_alveo['comparison']['figures'], result_fxp_vs_alveo['comparison']['figures'], 
+    return
+
+
+@app.cell
+def _(
+    PATHS,
+    os,
+    result_float_vs_alveo,
+    result_float_vs_fxp,
+    result_fxp_vs_alveo,
+):
+    import plotly.graph_objects as go
+    import matplotlib.pyplot as plt
+
+    # 1. Define the output directory
+    figures_dir = os.path.join(PATHS.experiments_dir, "w16a16_figures")
+    os.makedirs(figures_dir, exist_ok=True)
+
+    print(f"Saving figures to: {figures_dir}")
+
+    # 2. Helper function to save figuresf
+    def save_scenario_figures(result_dict, file_prefix):
+        figs = result_dict["comparison"]["figures"]
+
+        # If 'figs' is a dictionary (e.g. {'name': fig}), iterate items.
+        # If it's a list, iterate with index.
+        if isinstance(figs, dict):
+            iterator = figs.items() # (name, fig_obj)
+        elif isinstance(figs, (list, tuple)):
+            iterator = enumerate(figs) # (index, fig_obj)
+        else:
+            iterator = [(0, figs)] # Single object
+
+        for identifier, fig in iterator:
+            # Clean filename
+            clean_id = str(identifier).replace(" ", "_").replace("/", "-")
+            filename = f"{file_prefix}_{clean_id}.png"
+            save_path = os.path.join(figures_dir, filename)
+
+            try:
+                # CASE A: It is a Dictionary (Plotly dict or wrapper)67:8080
+                if isinstance(fig, dict):
+                    # Check if it's a Plotly serialization
+                    if 'data' in fig and 'layout' in fig:
+                        fig_obj = go.Figure(fig)
+                        fig_obj.write_image(save_path)
+                        print(f"Saved (Plotly Dict): {filename}")
+                    else:
+                        print(f"Skipped {filename}: Dict structure unknown (keys: {list(fig.keys())})")
+
+                # CASE B: It is a Matplotlib Figure
+                elif hasattr(fig, 'savefig'):
+                    fig.savefig(save_path, bbox_inches='tight', dpi=300)
+                    print(f"Saved (Matplotlib): {filename}")
+
+                # CASE C: It is a Plotly Figure object
+                elif hasattr(fig, 'write_image'):
+                    fig.write_image(save_path)
+                    print(f"Saved (Plotly Object): {filename}")
+
+                else:
+                    print(f"Skipped {filename}: Unknown type {type(fig)}")
+
+            except Exception as e:
+                print(f"Error saving {filename}: {e}")
+
+    # 3. Save each scenario
+    save_scenario_figures(result_float_vs_fxp, "float_vs_fxp")
+    save_scenario_figures(result_float_vs_alveo, "float_vs_alveo")
+    save_scenario_figures(result_fxp_vs_alveo, "fxp_vs_alveo")
     return
 
 

@@ -63,7 +63,6 @@ class AlveoEvaluator:
                 batch_y_true = np.squeeze(inputs[1][0])     # (B,)
 
                 B, T, F = batch_input.shape
-                print(f"{B}, {T}, {F}")
 
                 if T * F != flat_block:
                     raise AssertionError(
@@ -82,7 +81,6 @@ class AlveoEvaluator:
                     verbose=False,
                 )
                 batch_output = torch.tensor(out_np, dtype=torch.float32)
-                print(batch_output.shape)
 
                 batch_score = loss_fn(batch_input, batch_output)
                 batch_y_score_per_sample = batch_score.mean(dim=(1, 2))
