@@ -54,7 +54,7 @@ def ptq_dse():
     )
     
     # Path to the saved floating-point model checkpoint
-    SAVED_FLOAT_MODEL_PATH = PATHS.experiments_dir / "adv_trained_model.pt"
+    SAVED_FLOAT_MODEL_PATH = PATHS.experiments_dir / "adv_trained_model_attack_eps_0.005.pt"
     if not SAVED_FLOAT_MODEL_PATH.exists():
         logging.error(f"Pre-trained model not found at: {SAVED_FLOAT_MODEL_PATH}")
         return
@@ -78,7 +78,7 @@ def ptq_dse():
 
     # --- DSE Setup ---
     mlflow.set_tracking_uri(MLFLOW_CONFIG.tracking_uri)
-    mlflow.set_experiment(f"PTQ_DSE_ADV_{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+    mlflow.set_experiment(f"PTQ_DSE_ADV_ANON_{datetime.now().strftime('%Y%m%d-%H%M%S')}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

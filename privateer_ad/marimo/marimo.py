@@ -134,7 +134,7 @@ def _(
     os,
 ):
     mo.md("### 4) Create Alveo runner")
-    XCLBIN_PATH = os.path.join(PATHS.experiments_dir, "alveo_xclbins", "attention_ae_adv_W16A16.xclbin")
+    XCLBIN_PATH = os.path.join(PATHS.experiments_dir, "alveo_xclbins", "attention_ae_adv_anon_W16A16.xclbin")
 
     # Bus can be None if you only want overlay + kernel (no power scraping)
     DEVICE_BUS = None  # e.g. "0000:af:00.1"
@@ -170,7 +170,7 @@ def _(ModelConfig, PATHS, TransformerAD, cuda_device, mo, os, torch):
 
     # 1. Define Paths and Configuration
 
-    model_path = os.path.join(PATHS.experiments_dir, "adv_trained_model.pt")
+    model_path = os.path.join(PATHS.experiments_dir, "adv_trained_model_attack_eps_0.005.pt")
 
     # This config matches the architecture of the model
     adv_model_config = ModelConfig(
@@ -195,6 +195,14 @@ def _(ModelConfig, PATHS, TransformerAD, cuda_device, mo, os, torch):
     adv_model.eval()
     print("Successfully loaded 'adv_trained_model.pt' weights.")
     return adv_model, adv_model_config, state_dict
+
+
+@app.cell
+def _(adv_model):
+    from torchinfo import summary
+
+    summary(adv_model)
+    return
 
 
 @app.cell
@@ -339,11 +347,11 @@ def _(
     for display_name, base_key in metric_map.items():
         g_key = f"golden_{base_key}"
         a_key = f"approx_{base_key}"
-    
+
         g_val = g_metrics.get(g_key, 0.0)
         a_val = a_metrics.get(a_key, 0.0)
         diff = a_val - g_val
-    
+
         table_data.append({
             "Metric": display_name,
             "Golden (Float)": g_val,
@@ -470,20 +478,20 @@ def _(calibration_input, fxp_model, mo, os):
             post_process_header_for_specific_types,
         )
 
-    OUTPUT_DIR = os.path.join("app", "outputs", "fxp_w16a16_no_w_quant")
+    OUTPUT_DIR = os.path.join("app", "outputs", "fxp_w16a16_adv_anon")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # Save the final, calibrated qconfig for inspection
     qconfig_w16_a16_path = os.path.join(
-        OUTPUT_DIR, "adv_model_w16_a16_qconfig.json"
+        OUTPUT_DIR, "adv_anon_model_w16_a16_qconfig.json"
     )
     with open(qconfig_w16_a16_path, "w") as f:
         f.write(fxp_model.q_config.model_dump_json(indent=2))
     print(f"\nSaved calibrated QConfig to {qconfig_w16_a16_path}")
 
     # Export weights to JSON and H files
-    json_path_w16_a16 = os.path.join(OUTPUT_DIR , "adv_model_w16_a16.json")
-    h_path_w16_a16 = os.path.join(OUTPUT_DIR , "adv_model_w16_a16.h")
+    json_path_w16_a16 = os.path.join(OUTPUT_DIR , "adv_anon_model_w16_a16.json")
+    h_path_w16_a16 = os.path.join(OUTPUT_DIR , "adv_anon_model_w16_a16.h")
 
     print(
         f"\nExporting float model weights to {json_path_w16_a16} and {h_path_w16_a16}..."
