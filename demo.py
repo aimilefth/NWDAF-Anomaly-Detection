@@ -27,7 +27,7 @@ import urllib3
 from dash import dcc, html, Input, Output, State
 
 from privateer_ad.architectures.transformer_ad import TransformerAD
-from privateer_ad.etl import DataProcessor
+from privateer_ad.old_data_utils import OldDataProcessor
 from privateer_ad.config import (
     DataConfig,
     MetadataConfig,
@@ -87,7 +87,7 @@ MLFLOW_RUN_ID = _env_as_str('PRIVATEER_MLFLOW_RUN_ID')
 MLFLOW_RUN_NAME = _env_as_str('PRIVATEER_MLFLOW_RUN_NAME', 'bright-chimp-326')
 MLFLOW_ARTIFACT_PATH = _env_as_str('PRIVATEER_MLFLOW_ARTIFACT_PATH', 'TransformerAD')
 # I dont have val_inference.csv.
-INFERENCE_DATASET_FILENAME = os.getenv('PRIVATEER_INFERENCE_DATASET', 'val_inference.csv')
+INFERENCE_DATASET_FILENAME = os.getenv('PRIVATEER_INFERENCE_DATASET', 'test.csv')
 TUNING_DATASET_FILENAME = os.getenv('PRIVATEER_TUNING_DATASET', 'val.csv')
 RECOMPUTE_THRESHOLD = _env_as_bool(os.getenv('PRIVATEER_RECOMPUTE_THRESHOLD'), default=False)
 TARGET_FPR = float(os.getenv('PRIVATEER_TARGET_FPR', '0.01'))
@@ -103,7 +103,7 @@ urllib3.disable_warnings(InsecureRequestWarning)
 XAI_SHAP_BASE_URL = "http://localhost:5000/xai/shap"
 
 # Simulation pacing: default to 0s (no artificial delay) so throughput reflects raw model speed.
-SIMULATION_INTERVAL_SECONDS = float(os.getenv('PRIVATEER_SIM_INTERVAL', '0.0'))
+SIMULATION_INTERVAL_SECONDS = float(os.getenv('PRIVATEER_SIM_INTERVAL', '0.5'))
 
 
 def _shap_iframe_src(view: str, serial: int) -> str:
@@ -346,10 +346,24 @@ class PrivateerAnomalyDetector:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Initialize DataProcessor with streaming config
-        self.data_processor = DataProcessor(self.data_config)
-        self.test_ds = self.data_processor.get_dataset(self.inference_dataset_path, only_benign=False)
+        # Initialize DataProcessor with streaming config
+        self.data_processor = OldDataProcessor(use_old_metadata=False)
+        self.test_ds = self.data_processor.get_dataset(
+            split=self.inference_dataset_path, 
+            seq_len=self.data_config.seq_len,
+            batch_size=self.data_config.batch_size,
+            only_benign=False,
+            num_workers=self.data_config.num_workers
+        )
         # Shuffle for demo to surface attacks quickly
-        self.test_dl = self.data_processor.get_dataloader(self.inference_dataset_path, only_benign=False, train=True)
+        self.test_dl = self.data_processor.get_dataloader(
+            split=self.inference_dataset_path, 
+            seq_len=self.data_config.seq_len,
+            batch_size=self.data_config.batch_size,
+            only_benign=False, 
+            shuffle=True,
+            num_workers=self.data_config.num_workers
+        )
         self.threshold = 0.0209596287459135  # Default threshold
         self.loss_fn = None
         self.model = None
@@ -530,7 +544,14 @@ class PrivateerAnomalyDetector:
             logging.warning("Tuning dataset %s not found; falling back to inference dataset %s", tuning_path, self.inference_dataset_path)
             tuning_path = self.inference_dataset_path
 
-        eval_dl = self.data_processor.get_dataloader(tuning_path, only_benign=False, train=False)
+        eval_dl = self.data_processor.get_dataloader(
+            split=tuning_path, 
+            seq_len=self.data_config.seq_len,
+            batch_size=self.data_config.batch_size,
+            only_benign=False, 
+            shuffle=False,
+            num_workers=self.data_config.num_workers
+        )        
         errors: list[float] = []
         labels: list[int | None] = []
 

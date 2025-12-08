@@ -371,3 +371,55 @@ class OldDataProcessor:
             persistent_workers=bool(num_workers > 0),
             shuffle=shuffle if split == "train" else False,
         )
+
+    def get_dataset(
+        self,
+        split: str,               # 'train'|'val'|'test'
+        use_pca: bool = False,
+        batch_size: int = 4096,   # old default large batch by default
+        seq_len: int = 12,        # old default seq_len
+        partition_id: Optional[int] = None,
+        only_benign: bool = False,
+        num_workers: int = 16,
+        shuffle: bool = True,
+    ) -> TimeSeriesDataSet:
+        """
+        Same as self.get_dataloader, but returns TimeSeriesDataset
+        Usage in demo.py!
+        """
+        df = self.preprocess_data(
+            path=split,
+            use_pca=use_pca,
+            setup=False,
+            partition_id=partition_id,
+        )
+
+        if only_benign:
+            if "attack" in df.columns:
+                df = df[df["attack"] == 0]
+            else:
+                print("[old_data_utils] WARNING: 'attack' column missing; benign filter skipped.")
+
+        df = df.sort_values(by=["_time"]).reset_index(drop=True)
+        if use_pca:
+            input_cols = [c for c in df.columns if c.startswith("pca")]
+        else:
+            input_cols = self.input_features
+
+        # per-device time index as in old code
+        df["time_idx"] = df.groupby("imeisv")["_time"].cumcount()
+
+        ts = TimeSeriesDataSet(
+            data=df,
+            time_idx="time_idx",
+            target="attack",
+            group_ids=["imeisv"],
+            max_encoder_length=seq_len,
+            max_prediction_length=1,
+            time_varying_unknown_reals=input_cols,
+            scalers=None,
+            target_normalizer=None,
+            allow_missing_timesteps=False,
+        )
+
+        return ts
