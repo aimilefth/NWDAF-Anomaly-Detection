@@ -1202,21 +1202,30 @@ app.layout = dbc.Container([
         ], width=12)
     ], className="mb-4"),
 
-    dbc.Row([
+dbc.Row([
         dbc.Col([
             dbc.Card([
                 dbc.CardBody([
                     html.H4("📊 Network Feature Values (Privacy-Preserved)", className="card-title"),
-                    dcc.Graph(id="feature-display", style={'height': '400px'})
+                    # Changed height to 850px to cover the two stacked graphs on the right
+                    dcc.Graph(id="feature-display", style={'height': '850px'})
                 ])
             ])
         ], width=6),
 
         dbc.Col([
+            # CPU Detection
             dbc.Card([
                 dbc.CardBody([
-                    html.H4("🚨 Anomaly Detection Results", className="card-title"),
-                    dcc.Graph(id="anomaly-detection", style={'height': '400px'})
+                    html.H4("🚨 Anomaly Detection Results (CPU)", className="card-title"),
+                    dcc.Graph(id="anomaly-detection-cpu", style={'height': '400px'})
+                ])
+            ], className="mb-4"),
+            # FPGA Detection (Stacked below CPU)
+            dbc.Card([
+                dbc.CardBody([
+                    html.H4("🚨 Anomaly Detection Results (FPGA)", className="card-title"),
+                    dcc.Graph(id="anomaly-detection-fpga", style={'height': '400px'})
                 ])
             ])
         ], width=6)
@@ -1271,6 +1280,7 @@ app.layout = dbc.Container([
     ], className="mb-4"),
 
     dbc.Row([
+        # Width changed from 6 to 4
         dbc.Col([
                     dbc.Card([
                         dbc.CardBody([
@@ -1288,15 +1298,34 @@ app.layout = dbc.Container([
                             ),
                             dcc.Graph(
                                 id="latency-graph",
-                                style={'height': '520px', 'width': '520px', 'margin': '0 auto'}
+                                style={'height': '520px', 'width': '100%', 'margin': '0 auto'}
                             )
                         ])
             ])
-        ], width=6),
+        ], width=4),
+        
+        # NEW COLUMN for Absolute Difference
         dbc.Col([
             dbc.Card([
                 dbc.CardBody([
-                    html.H4("📊 Feature Influence SHAP (Last anomaly detected)", className="card-title"),
+                    html.H4("🔍 Reconstruction Error Difference", className="card-title"),
+                    html.Small(
+                        "Absolute difference between CPU and FPGA reconstruction errors.",
+                        className="text-muted d-block mb-3"
+                    ),
+                    dcc.Graph(
+                        id="diff-graph",
+                        style={'height': '520px', 'width': '100%', 'margin': '0 auto'}
+                    )
+                ])
+            ])
+        ], width=4),
+
+        # Width changed from 6 to 4
+        dbc.Col([
+            dbc.Card([
+                dbc.CardBody([
+                    html.H4("📊 Feature Influence SHAP", className="card-title"),
                     html.Div(
                         id="shap-timeseries-container",
                         children=_shap_placeholder(),
@@ -1304,7 +1333,7 @@ app.layout = dbc.Container([
                     )
                 ])
             ])
-        ], width=6)
+        ], width=4)
     ], className="mb-4", justify="center"),
 
     dbc.Row([
@@ -1499,7 +1528,9 @@ def control_simulation(start_clicks, stop_clicks, reset_clicks, state):
 
 @app.callback(
     [Output('feature-display', 'figure'),
-     Output('anomaly-detection', 'figure'),
+     Output('anomaly-detection-cpu', 'figure'),   # Renamed from anomaly-detection
+     Output('anomaly-detection-fpga', 'figure'),  # NEW
+     Output('diff-graph', 'figure'),              # NEW
      Output('fpr-trend', 'figure'),
      Output('stats-display', 'children'),
      Output('device-list', 'children'),
@@ -1512,6 +1543,8 @@ def update_graphs(n, throughput_window, state):
     """Main callback for updating all dashboard visualizations."""
     if not state.get('running', False):
         return (
+            create_empty_figure("Simulation Stopped"),
+            create_empty_figure("Simulation Stopped"),
             create_empty_figure("Simulation Stopped"),
             create_empty_figure("Simulation Stopped"),
             create_empty_figure("Simulation Stopped"),
@@ -1582,7 +1615,12 @@ def update_graphs(n, throughput_window, state):
                 realtime_data[key] = realtime_data[key][-max_points:]
 
     feature_fig = create_feature_figure()
-    anomaly_fig = create_anomaly_figure()
+    # Create two separate anomaly figures
+    anomaly_fig_cpu = create_anomaly_figure(source='cpu')
+    anomaly_fig_fpga = create_anomaly_figure(source='alveo')
+    # Create the difference figure
+    diff_fig = create_diff_figure()
+
     fpr_fig = create_fpr_figure()
     stats = create_statistics()
     device_list = create_device_list()
@@ -1590,13 +1628,14 @@ def update_graphs(n, throughput_window, state):
 
     return (
         feature_fig,
-        anomaly_fig,
+        anomaly_fig_cpu,
+        anomaly_fig_fpga,
+        diff_fig,
         fpr_fig,
         stats,
         device_list,
         latency_fig
     )
-
 
 @app.callback(
     Output('hitl-panel', 'children'),
@@ -2043,25 +2082,60 @@ def create_feature_figure():
     return fig
 
 
-def create_anomaly_figure():
-    """Create reconstruction error plot with threshold and ground truth markers."""
+def create_anomaly_figure(source='cpu'):
+    """
+    Create reconstruction error plot.
+    source: 'cpu' or 'alveo'
+    """
     if not realtime_data['timestamp']:
         return create_empty_figure("No Data Available")
 
-    # Keep the visualization ordered by timestamp, even if ingestion comes unordered.
     idx_sorted = sorted(range(len(realtime_data['timestamp'])), key=lambda i: realtime_data['timestamp'][i])
     timestamps = [realtime_data['timestamp'][i] for i in idx_sorted]
-    errors = [realtime_data['reconstruction_error'][i] for i in idx_sorted]
-    is_anomaly_flags = [realtime_data['is_anomaly'][i] for i in idx_sorted]
-    true_labels = [realtime_data['true_label'][i] for i in idx_sorted]
+
+    # Select data based on source
+    if source == 'alveo':
+        # Check if Alveo data exists (not None)
+        valid_data = [x for x in realtime_data['score_alveo'] if x is not None]
+        if not valid_data:
+            return create_empty_figure("FPGA is not initialized")
+            
+        errors = [realtime_data['score_alveo'][i] for i in idx_sorted]
+        is_anomaly_flags = [realtime_data['is_anomaly_alveo'][i] for i in idx_sorted]
+        # Use alveo specific labels if available, else fallback to common
+        true_labels = [realtime_data['true_label_alveo'][i] if realtime_data['true_label_alveo'][i] is not None 
+                       else realtime_data['true_label'][i] for i in idx_sorted]
+        title_suffix = "(FPGA)"
+    else:
+        errors = [realtime_data['reconstruction_error'][i] for i in idx_sorted]
+        is_anomaly_flags = [realtime_data['is_anomaly'][i] for i in idx_sorted]
+        true_labels = [realtime_data['true_label'][i] for i in idx_sorted]
+        title_suffix = "(CPU)"
+
+    # Handle case where filtered data might be None in the list (if mixed)
+    # Replace None with 0.0 or skip for plotting safety
+    clean_errors = []
+    clean_timestamps = []
+    clean_flags = []
+    clean_labels = []
+    
+    for t, e, f, l in zip(timestamps, errors, is_anomaly_flags, true_labels):
+        if e is not None:
+            clean_timestamps.append(t)
+            clean_errors.append(e)
+            clean_flags.append(f)
+            clean_labels.append(l)
+
+    if not clean_timestamps:
+        return create_empty_figure(f"No {source.upper()} Data")
 
     fig = go.Figure()
 
-    colors = ['red' if anomaly else 'blue' for anomaly in is_anomaly_flags]
+    colors = ['red' if anomaly else 'blue' for anomaly in clean_flags]
 
     fig.add_trace(go.Scatter(
-        x=timestamps,
-        y=errors,
+        x=clean_timestamps,
+        y=clean_errors,
         mode='markers+lines',
         name='Reconstruction Error',
         marker=dict(color=colors, size=6),
@@ -2077,8 +2151,8 @@ def create_anomaly_figure():
     )
 
     # Add ground truth markers
-    true_anomaly_times = [timestamps[i] for i, label in enumerate(true_labels) if label == 1]
-    true_anomaly_scores = [errors[i] for i, label in enumerate(true_labels) if label == 1]
+    true_anomaly_times = [clean_timestamps[i] for i, label in enumerate(clean_labels) if label == 1]
+    true_anomaly_scores = [clean_errors[i] for i, label in enumerate(clean_labels) if label == 1]
 
     if true_anomaly_times:
         fig.add_trace(go.Scatter(
@@ -2091,12 +2165,59 @@ def create_anomaly_figure():
         ))
 
     fig.update_layout(
-        title="TransformerAD Anomaly Detection (with Differential Privacy)",
+        title=f"Reconstruction Error {title_suffix}",
         xaxis_title="Time",
-        yaxis_title="Reconstruction Error (L1 Loss)",
-        hovermode='x unified'
+        yaxis_title="L1 Loss",
+        hovermode='x unified',
+        margin=dict(t=40, b=20)
     )
 
+    return fig
+
+
+def create_diff_figure():
+    """Create a plot showing absolute difference between CPU and Alveo scores."""
+    if not realtime_data['timestamp']:
+        return create_empty_figure("No Data Available")
+
+    idx_sorted = sorted(range(len(realtime_data['timestamp'])), key=lambda i: realtime_data['timestamp'][i])
+    
+    diffs = []
+    timestamps = []
+    
+    has_valid_alveo = False
+
+    for i in idx_sorted:
+        cpu_score = realtime_data['reconstruction_error'][i]
+        alveo_score = realtime_data['score_alveo'][i]
+        
+        if cpu_score is not None and alveo_score is not None:
+            has_valid_alveo = True
+            diffs.append(abs(cpu_score - alveo_score))
+            timestamps.append(realtime_data['timestamp'][i])
+    
+    if not has_valid_alveo:
+        return create_empty_figure("FPGA is not initialized")
+
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=timestamps,
+        y=diffs,
+        mode='markers+lines',
+        name='Abs Diff',
+        line=dict(color='#fd7e14', width=2),
+        marker=dict(size=4)
+    ))
+    
+    fig.update_layout(
+        title="Reconstruction Error Difference (CPU vs FPGA)",
+        xaxis_title="Time",
+        yaxis_title="|CPU - FPGA|",
+        hovermode='x unified',
+        margin=dict(t=40, b=20)
+    )
+    
     return fig
 
 
