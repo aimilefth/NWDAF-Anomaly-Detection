@@ -51,7 +51,7 @@ exported_anomalies = []
 
 SHAP_MAX_SEQ_LEN = int(os.getenv('SHAP_MAX_SEQ_LEN', '12'))
 
-DEFAULT_ANON_EPSILON = float(os.getenv('ANONYMIZER_EPSILON', '0.0'))
+DEFAULT_ANON_EPSILON = float(os.getenv('ANONYMIZER_EPSILON', '0.01'))
 ANONYMIZER_SENSITIVITY = float(os.getenv('ANONYMIZER_SENSITIVITY', '0.0'))
 EPSILON_MIN = float(os.getenv('ANONYMIZER_EPSILON_MIN', '0.01'))
 EPSILON_MAX = float(os.getenv('ANONYMIZER_EPSILON_MAX', '1.0'))
