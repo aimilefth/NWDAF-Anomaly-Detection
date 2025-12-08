@@ -7,6 +7,7 @@ import queue
 import logging
 import os
 import hashlib
+import sys
 from collections import deque
 from pathlib import Path
 
@@ -36,6 +37,15 @@ from privateer_ad.config import (
     MLFlowConfig
 )
 from privateer_ad.utils import load_model_weights, load_mlflow_model_from_run
+try:
+    from privateer_ad.alveo.alveo_runner import AlveoRunner, AlveoRunnerParameters
+    ALVEO_MODULE_AVAILABLE = True
+except ImportError:
+    logging.warning("⚠️ AlveoRunner module not found in 'privateer_ad.alveo'. FPGA features will be disabled.")
+    AlveoRunner = None
+    AlveoRunnerParameters = None
+    ALVEO_MODULE_AVAILABLE = False
+
 
 exported_anomalies = []
 
@@ -83,6 +93,9 @@ RECOMPUTE_THRESHOLD = _env_as_bool(os.getenv('PRIVATEER_RECOMPUTE_THRESHOLD'), d
 TARGET_FPR = float(os.getenv('PRIVATEER_TARGET_FPR', '0.01'))
 THRESHOLD_STRATEGY = os.getenv('PRIVATEER_THRESHOLD_STRATEGY', 'f1').strip().lower()
 TARGET_PRECISION = float(os.getenv('PRIVATEER_TARGET_PRECISION', '0.90'))
+
+USE_FPGA = _env_as_bool(os.getenv('PRIVATEER_USE_FPGA'), default=True)
+ALVEO_XCLBIN_PATH = os.getenv('PRIVATEER_ALVEO_XCLBIN_PATH', os.path.join('experiments', "alveo_xclbins", "attention_ae_adv_anon_W16A16.xclbin"))
 
 urllib3.disable_warnings(InsecureRequestWarning)
 
@@ -303,6 +316,7 @@ class PrivateerAnomalyDetector:
         mlflow_run_name: str | None = MLFLOW_RUN_NAME,
         mlflow_run_id: str | None = MLFLOW_RUN_ID,
         mlflow_artifact_path: str | None = MLFLOW_ARTIFACT_PATH,
+        runner: AlveoRunner = None,
     ):
         """Initialize detector with specified model and privacy configurations."""
         self.model_name = model_name
@@ -310,6 +324,7 @@ class PrivateerAnomalyDetector:
         self.mlflow_run_name = mlflow_run_name
         self.mlflow_run_id = mlflow_run_id
         self.mlflow_artifact_path = mlflow_artifact_path or 'global_TransformerAD'
+        self.runner = runner
 
         self.data_config = DataConfig()
         self.data_config.num_workers = 0
@@ -457,6 +472,37 @@ class PrivateerAnomalyDetector:
 
         except Exception as e:
             logging.error(f"❌ Error in anomaly detection: {e}")
+            return False, 0.0, None
+
+    def detect_anomaly_alveo(self, input_batch):
+        """
+        Run anomaly detection using the Alveo FPGA Runner.
+        """
+        try:
+            # Extract input tensor and true label
+            # Shape is expected to be [1, seq_len, features]
+            input_tensor = input_batch[0]['encoder_cont']
+            true_label = input_batch[1][0].item() if len(input_batch) > 1 else None
+            
+            # Convert to numpy for Alveo
+            input_np = input_tensor.cpu().numpy()
+            
+            # Run inference on FPGA
+            # run_vector expects flattened input, output_shape handles the reshape back
+            output_np = self.runner.run_vector(input_np, output_shape=input_np.shape)
+            
+            # Calculate reconstruction error (L1 / Mean Absolute Error)
+            # Matching logic: self.loss_fn(input, output).mean(dim=(1, 2))
+            diff = np.abs(input_np - output_np)
+            reconstruction_error = np.mean(diff)
+
+            # Determine if anomaly
+            is_anomaly = reconstruction_error > self.threshold
+
+            return is_anomaly, float(reconstruction_error), true_label
+
+        except Exception as e:
+            logging.error(f"❌ Error in Alveo anomaly detection: {e}")
             return False, 0.0, None
 
     def update_threshold(self, new_threshold):
@@ -640,6 +686,17 @@ class NetworkTrafficSimulator:
                 start = time.perf_counter()
                 is_anomaly, score, true_label = self.detector.detect_anomaly(sample)
                 inference_latency_ms = (time.perf_counter() - start) * 1000
+
+                is_anomaly_alveo = None
+                score_alveo = None
+                true_label_alveo = None
+                latency_ms_alveo = None
+
+                if self.detector.runner is not None:
+                    start_alveo = time.perf_counter()
+                    is_anomaly_alveo, score_alveo, true_label_alveo = self.detector.detect_anomaly_alveo(sample)
+                    latency_ms_alveo = (time.perf_counter() - start_alveo) * 1000
+
                 self.latency_window.append(inference_latency_ms)
                 avg_latency = (sum(self.latency_window) / len(self.latency_window)
                                if self.latency_window else inference_latency_ms)
@@ -658,6 +715,12 @@ class NetworkTrafficSimulator:
                     'is_anomaly': is_anomaly,
                     'reconstruction_error': score,
                     'true_label': true_label,
+                    # Alveo specific data
+                    'is_anomaly_alveo': is_anomaly_alveo,
+                    'score_alveo': score_alveo,
+                    'true_label_alveo': true_label_alveo,
+                    'latency_ms_alveo': latency_ms_alveo,
+                    # Common data
                     'input_tensor': sample[0]['encoder_cont'].cpu().numpy(),
                     'latency_ms': inference_latency_ms,
                     'feature_values': {},
@@ -801,9 +864,67 @@ class NetworkTrafficSimulator:
             return None
 
 
+def init_alveo_runner(xclbin_path: str, device_num: int, seq_len: int, n_features: int): 
+    # Requirement: Run the setup source logic before initializing pynq
+    # source ${SETUP_DIR}/${SETUP_FILE}
+    if not ALVEO_MODULE_AVAILABLE:
+        return None
+
+    alveo_runner = None
+    try:
+        import pynq # Import here to ensure env vars (XILINX_XRT) are set
+        
+        # Check for XCLBIN        
+        if os.path.exists(xclbin_path):
+            try:
+                device_list = list(pynq.Device.devices)
+            except Exception as e:
+                logging.warning(f"⚠️ Failed to list PYNQ devices (XRT issues?): {e}")
+                device_list = []
+
+            if device_list:
+                # Ensure index is within bounds
+                if device_num >= len(device_list):
+                    logging.warning(f"⚠️ Device index {device_num} out of bounds. Using 0.")
+                    device_num = 0
+                
+                device = device_list[device_num]
+                logging.info(f"🔮 Found Alveo Device: {device.name}")
+                
+                params = AlveoRunnerParameters(
+                    input_buffer_elements=seq_len * n_features,
+                    output_buffer_elements=seq_len * n_features,
+                    kernel_name=None 
+                )
+                
+                alveo_runner = AlveoRunner(
+                    bitstream_path=xclbin_path,
+                    parameters=params,
+                    device=device,
+                    device_bus=None
+                )
+                logging.info("✅ AlveoRunner initialized.")
+            else:
+                logging.warning("⚠️ No PYNQ devices found. Alveo acceleration disabled.")
+        else:
+            logging.warning(f"⚠️ XCLBIN not found at {xclbin_path}. Alveo acceleration disabled.")
+        return alveo_runner
+    except ImportError:
+        logging.warning("⚠️ PYNQ library not installed. Alveo acceleration disabled.")
+        return None
+    except Exception as e:
+        logging.warning(f"⚠️ AlveoRunner init failed: {e}")
+        return None
+
+
 # Initialize components
 logging.info("🔄 Initializing PRIVATEER components...")
-detector = PrivateerAnomalyDetector()
+if USE_FPGA:
+    alveo_runner = init_alveo_runner(xclbin_path=ALVEO_XCLBIN_PATH, device_num=0, seq_len=12, n_features=8)
+else:
+    alveo_runner = None
+
+detector = PrivateerAnomalyDetector(runner=alveo_runner)
 anonymizer = DemoAnonymizer()
 simulator = NetworkTrafficSimulator(detector, anonymizer)
 simulators = [simulator]
@@ -829,6 +950,12 @@ realtime_data = {
     'true_label': [],
     'anonymized_device_id': [],
     'latency_ms': [],
+    # --- ALVEO ---
+    'is_anomaly_alveo': [],
+    'score_alveo': [],
+    'true_label_alveo': [],
+    'latency_ms_alveo': [],
+    # -------------
     'raw_feature_values': {},  
     'feature_values': {},
     'shap_values': [],
@@ -1407,7 +1534,12 @@ def update_graphs(n, throughput_window, state):
         realtime_data['anonymized_device_id'].append(data_point['anonymized_device_id'])
         realtime_data['raw_inputs'].append(data_point['input_tensor'])
         realtime_data['latency_ms'].append(data_point.get('latency_ms'))
-
+        # --- ALVEO ---
+        realtime_data['is_anomaly_alveo'].append(data_point.get('is_anomaly_alveo'))
+        realtime_data['score_alveo'].append(data_point.get('score_alveo'))
+        realtime_data['true_label_alveo'].append(data_point.get('true_label_alveo'))
+        realtime_data['latency_ms_alveo'].append(data_point.get('latency_ms_alveo'))
+        # -------------
         # Add feature values (anonymized)
         for feature, value in data_point['feature_values'].items():
             if feature in realtime_data['feature_values']:
@@ -1705,8 +1837,8 @@ def create_throughput_figure(window_seconds):
 
 
 def create_latency_figure(window_seconds):
-    """Show average inference latency (ms) per device within the aggregation window."""
-    if not realtime_data['timestamp'] or not realtime_data['latency_ms']:
+    """Show average inference latency (ms) comparison: CPU vs FPGA."""
+    if not realtime_data['timestamp']:
         return create_empty_figure("No Data Available")
 
     try:
@@ -1719,32 +1851,45 @@ def create_latency_figure(window_seconds):
     latest_ts = realtime_data['timestamp'][-1]
     cutoff = latest_ts - timedelta(seconds=window_seconds)
 
-    latencies_by_device: dict[str, list[float]] = {}
-    for ts, device_label, latency in zip(
-        realtime_data['timestamp'],
-        realtime_data.get('runtime_device', []),
-        realtime_data.get('latency_ms', []),
-    ):
-        if ts < cutoff or latency is None:
-            continue
-        label = (device_label or 'cpu').upper()
-        if label == 'GPU':
-            label = 'FPGA'
-        latencies_by_device.setdefault(label, []).append(float(latency))
+    cpu_latencies = []
+    alveo_latencies = []
 
-    if not latencies_by_device:
+    # Iterate backwards or zip through lists
+    # Assuming lists are synchronized by index
+    for i, ts in enumerate(realtime_data['timestamp']):
+        if ts < cutoff:
+            continue
+        
+        # Host latency
+        if realtime_data['latency_ms'][i] is not None:
+            cpu_latencies.append(realtime_data['latency_ms'][i])
+        
+        # Alveo latency
+        if realtime_data['latency_ms_alveo'][i] is not None:
+            alveo_latencies.append(realtime_data['latency_ms_alveo'][i])
+
+    if not cpu_latencies and not alveo_latencies:
         return create_empty_figure("No Data Available")
 
-    avg_latency = {
-        label: (sum(vals) / len(vals)) for label, vals in latencies_by_device.items()
-    }
+    averages = {}
+    if cpu_latencies:
+        averages['CPU'] = sum(cpu_latencies) / len(cpu_latencies)
+    if alveo_latencies:
+        averages['FPGA'] = sum(alveo_latencies) / len(alveo_latencies)
 
     fig = go.Figure()
-    labels = sorted(avg_latency.keys())
+    labels = list(averages.keys())
+    values = list(averages.values())
+    
+    # Colors: Host = Blueish, Alveo = Orange/Reddish
+    colors = ['#7480ff' if 'CPU' in lbl else '#ff8b73' for lbl in labels]
+
     fig.add_trace(go.Bar(
         x=labels,
-        y=[avg_latency[label] for label in labels],
-        marker=dict(color=['#7480ff' if lbl == 'CPU' else '#ff8b73' for lbl in labels])
+        y=values,
+        marker=dict(color=colors),
+        text=[f"{v:.2f} ms" for v in values],
+        textposition='auto'
     ))
 
     fig.update_layout(
