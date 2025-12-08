@@ -48,6 +48,9 @@ EPSILON_MAX = float(os.getenv('ANONYMIZER_EPSILON_MAX', '1.0'))
 EPSILON_STEP = float(os.getenv('ANONYMIZER_EPSILON_STEP', '0.01'))
 SENSITIVE_FEATURES = tuple(os.getenv('ANONYMIZER_SENSITIVE_FEATURES', 'dl_bitrate,ul_bitrate').split(','))
 EXPERIMENT_MODEL_ID = os.getenv('PRIVATEER_EXPERIMENT_ID', 'experiments/20250313-181907')
+# This contains the model 
+# [adv_trained_model_on_anonymized_data.zip](https://spacecollab.sharepoint.com/:u:/r/sites/PRIVATEER/Shared%20Documents/WP3.%20Decentralised%20Robust%20Security%20Analytics/Anomaly%20Detection%20Model/adv_trained_model_on_anonymized_data.zip?csf=1&web=1&e=PwV1f7)
+# EXPERIMENT_MODEL_ID = os.getenv('PRIVATEER_EXPERIMENT_ID', 'experiments/adv_anonymized_model/adv_trained_model_attack_eps_0.005.pt')
 
 def _env_as_bool(value: str | None, default: bool = False) -> bool:
     if value is None:
@@ -73,8 +76,9 @@ MISP_PASSWORD = os.getenv('MISP_PASSWORD') or "]3L2>9bzS'RFM*Z"
 MLFLOW_RUN_ID = _env_as_str('PRIVATEER_MLFLOW_RUN_ID')
 MLFLOW_RUN_NAME = _env_as_str('PRIVATEER_MLFLOW_RUN_NAME', 'bright-chimp-326')
 MLFLOW_ARTIFACT_PATH = _env_as_str('PRIVATEER_MLFLOW_ARTIFACT_PATH', 'TransformerAD')
-INFERENCE_DATASET_FILENAME = os.getenv('PRIVATEER_INFERENCE_DATASET', 'val_inference.csv')
-TUNING_DATASET_FILENAME = os.getenv('PRIVATEER_TUNING_DATASET', 'val_inference.csv')
+# I dont have val_inference.csv.
+INFERENCE_DATASET_FILENAME = os.getenv('PRIVATEER_INFERENCE_DATASET', 'test.csv')
+TUNING_DATASET_FILENAME = os.getenv('PRIVATEER_TUNING_DATASET', 'val.csv')
 RECOMPUTE_THRESHOLD = _env_as_bool(os.getenv('PRIVATEER_RECOMPUTE_THRESHOLD'), default=True)
 TARGET_FPR = float(os.getenv('PRIVATEER_TARGET_FPR', '0.01'))
 THRESHOLD_STRATEGY = os.getenv('PRIVATEER_THRESHOLD_STRATEGY', 'f1').strip().lower()
