@@ -46,6 +46,7 @@ services:
     ulimits:
       memlock: -1
       stack: 67108864
+    cpus: "20"   # half of 40
 
   app-fpga:
     image: aimilefth/privateer-ad:app-fpga-adv
@@ -73,3 +74,4 @@ services:
     ulimits:
       memlock: -1
       stack: 67108864
+    cpus: "20"   # half of 40

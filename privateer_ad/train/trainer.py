@@ -84,7 +84,7 @@ class ModelTrainer:
         }
 
 
-    def training(self, train_dl, val_dl, start_epoch: int = 0) -> Dict[str, Any]:
+    def training(self, train_dl, val_dl, test_dl = None, start_epoch: int = 0, validate_before_training: bool = False) -> Dict[str, Any]:
         """
         Execute complete training process with validation and early stopping.
 
@@ -96,14 +96,40 @@ class ModelTrainer:
         Args:
             train_dl: Training data loader
             val_dl: Validation data loader
+            test_dl (Optional): Test data loader for monitoring. If provided,
+                                test metrics will be computed each epoch.
             start_epoch (int): Starting epoch for training continuation
-
+            validate_before_training (bool): If True, runs a validation loop before the
+                                             first training epoch to establish a baseline.
         Returns:
             Dict[str, Any]: Best checkpoint containing model state, optimizer state,
                            metrics, and epoch information
         """
         logging.info('Start Training...')
         try:
+            if validate_before_training:
+                logging.info('Running initial validation before training loop...')
+                pre_train_epoch = start_epoch - 1 
+                initial_val_report = self._validation_loop(val_dl=val_dl)
+                
+                # --- MODIFICATION START ---
+                # Also run on test set if provided
+                initial_test_report = {}
+                if test_dl is not None:
+                    logging.info('Running initial test before training loop...')
+                    initial_test_report = self._test_loop(test_dl=test_dl)
+                # --- MODIFICATION END ---
+                    
+                self.log_metrics(initial_val_report | initial_test_report, pre_train_epoch)
+
+                self.best_checkpoint.update({
+                    'metrics': deepcopy(self.metrics),
+                    'epoch': pre_train_epoch,
+                    'model_state_dict': deepcopy(self.model.state_dict()),
+                    'optimizer_state_dict': deepcopy(self.optimizer.state_dict())
+                })
+                logging.info(f"Saved initial model state as baseline at epoch {pre_train_epoch}.")
+
             for epoch in range(start_epoch, start_epoch + self.training_config.epochs):
                 local_epoch = epoch - start_epoch
 
@@ -113,8 +139,14 @@ class ModelTrainer:
                 # Validation phase
                 val_report = self._validation_loop(val_dl=val_dl)
 
+                # --- MODIFICATION START ---
+                test_report = {}
+                if test_dl is not None:
+                    test_report = self._test_loop(test_dl=test_dl)
+                
                 # Log metrics
-                self.log_metrics(train_report | val_report, epoch)
+                self.log_metrics(train_report | val_report | test_report, epoch)
+                # --- MODIFICATION END ---
 
                 # Check if this is the best model so far
                 is_best = self._is_best_checkpoint()
@@ -254,6 +286,61 @@ class ModelTrainer:
             report_dict |= metrics | balanced_metrics
         report_dict = {f'_'.join(['val', k]) :  v for k, v in report_dict.items()}
         return report_dict
+
+    def _test_loop(self, test_dl) -> Dict[str, float]:
+        """
+        Validation with threshold optimization and balanced metrics.
+
+        Performs validation evaluation including reconstruction error computation,
+        optimal threshold selection using ROC analysis, and calculation of both
+        balanced and unbalanced performance metrics for thorough model assessment.
+
+        Returns:
+            Dict[str, float]: Validation metrics including loss,
+                             threshold, balanced and unbalanced performance scores
+        """
+        self.model.eval()
+
+        with torch.no_grad():
+            progress_bar = tqdm(test_dl, desc=' ' * 5 + 'Test')
+            x : List[float] = []
+            y_score: List[np.ndarray] | np.ndarray = []
+            y_true: List[np.ndarray] | np.ndarray = []
+
+            for inputs in progress_bar:
+                batch_input = inputs[0]['encoder_cont'].to(self.device)
+                batch_y_true = np.squeeze(inputs[1][0])
+                batch_output = self.model(batch_input)  # all samples
+
+                batch_loss = self.loss_fn(batch_input, batch_output)  # reconstruction loss
+                batch_y_score_per_sample = torch.mean(input=batch_loss, dim=(1, 2))
+
+                x.extend(batch_input.tolist())
+                y_true.extend(batch_y_true.tolist())
+                y_score.extend(batch_y_score_per_sample.cpu().tolist())  # reconstruction error per sample
+                progress_bar.set_postfix({'test_loss': torch.mean(batch_y_score_per_sample).item()})
+
+            y_score = np.array(y_score, dtype=np.float32)
+            y_true = np.array(y_true, dtype=np.int32)
+        target_names = ['benign', 'malicious']
+        # Compute threshold from balanced data samples
+        fpr, tpr, thresholds = roc_curve(y_true=y_true, y_score=y_score)
+        optimal_idx = np.argmin(np.sqrt(np.power(fpr, 2) + np.power(1 - tpr, 2)))
+        threshold = thresholds[optimal_idx]
+
+        # Compute metrics
+        metrics = self.calculate_metrics(rec_errors=y_score,
+                                        y_true=y_true,
+                                        threshold=threshold,
+                                        target_names=target_names,
+                                        prefix='')
+        report_dict = {'loss': np.mean(y_score),
+            'threshold': float(threshold)}
+
+        report_dict |= metrics
+        report_dict = {f'_'.join(['test', k]) :  v for k, v in report_dict.items()}
+        return report_dict
+
 
     def calculate_metrics(self, rec_errors, y_true, threshold, target_names, prefix=''):
         y_pred = np.where(rec_errors >= threshold, 1, 0)

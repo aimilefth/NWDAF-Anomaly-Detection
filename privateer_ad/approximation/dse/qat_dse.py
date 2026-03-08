@@ -60,13 +60,14 @@ def qat_dse(adversarial_training: bool = False):
     THRESHOLD = 0.0209596287459135
 
     # --- DSE Grid Parameters ---
-    weight_bits_options = [16, 14, 12, 10]
-    activation_bits_options = [16, 14, 12, 10]
+    weight_bits_options = [16, 12, 8]
+    activation_bits_options = [16, 12, 8]
     weight_quant_type_options = ["min_mse"]
     calibration_type_options = ["min_mse"]
     test_batch_size = 2048
     calibration_batch_size = 131072
     qat_epochs = 100
+    lrs = [1e-4]
     
     # --- Robustness Training Parameters ---
     TR_EPSILON = 0.01
@@ -90,7 +91,7 @@ def qat_dse(adversarial_training: bool = False):
     train_dl = dp.get_dataloader("train", batch_size=4096, only_benign=True, num_workers=16)
     val_dl = dp.get_dataloader("val", batch_size=4096, only_benign=True, num_workers=16)
     test_dl = dp.get_dataloader("test", batch_size=4096, only_benign=False, num_workers=16)
-    calibration_dl = dp.get_dataloader("val", batch_size=131072, only_benign=True, num_workers=16)
+    calibration_dl = dp.get_dataloader("val", batch_size=calibration_batch_size, only_benign=True, num_workers=16)
     calibration_input = next(iter(calibration_dl))[0]["encoder_cont"].to(device)
     calibration_real_batch_size = calibration_input.shape[0]
 
@@ -149,13 +150,14 @@ def qat_dse(adversarial_training: bool = False):
         activation_bits_options,
         weight_quant_type_options,
         calibration_type_options,
+        lrs,
     ))
     total_runs = len(dse_configurations)
     results_summary = []
 
     logging.info(f"Starting {adv_suffix} DSE with {total_runs} configurations.")
 
-    for idx, (wb, ab, w_q_type, cal_type) in enumerate(dse_configurations, start=1):        
+    for idx, (wb, ab, w_q_type, cal_type, lr) in enumerate(dse_configurations, start=1):        
         
         dse_params = {
             "weight_bits": wb,
@@ -165,11 +167,12 @@ def qat_dse(adversarial_training: bool = False):
             "calibration_batch_size": calibration_real_batch_size,
             "qat_epochs": qat_epochs,
             "adversarial_training": adversarial_training,
+            "learning_rate": lr,
         }
         if adversarial_training:
             dse_params.update({"training_adv_eps": TR_EPSILON, "training_adv_eps_step": TR_EPS_STEP ,"training_adv_max_iter": TR_MAX_ITER})
 
-        run_name = f"{adv_suffix}_W{wb}_A{ab}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        run_name = f"{adv_suffix}_W{wb}_A{ab}_{lr}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         logging.info(f"--- Starting DSE run {idx}/{total_runs}: {run_name} ---")
         
         # Use a 'with' statement to manage the MLflow run for this trial
@@ -199,7 +202,7 @@ def qat_dse(adversarial_training: bool = False):
             
             # 4. Perform Quantization-Aware Training (Fine-tuning)
             logging.info(f"Starting QAT for {qat_epochs} epochs...")
-            qat_training_config = TrainingConfig(epochs=qat_epochs, target_metric='val_loss', direction='minimize')
+            qat_training_config = TrainingConfig(epochs=qat_epochs, learning_rate=lr, target_metric='val_loss', direction='minimize', es_enabled=False)
             optimizer = torch.optim.Adam(approximated_model.parameters(), lr=qat_training_config.learning_rate)
             
             trainer = ModelTrainer(
@@ -211,7 +214,7 @@ def qat_dse(adversarial_training: bool = False):
             
             # The forward pass of FxpTransformerAD with apply_ste=True handles QAT
             # The trainer will call this model's forward pass automatically
-            best_checkpoint = trainer.training(train_dl=train_dl_to_use, val_dl=val_dl_to_use)
+            best_checkpoint = trainer.training(train_dl=train_dl_to_use, val_dl=val_dl_to_use, test_dl=test_dl, validate_before_training=True)
             
             # Load the best state found during fine-tuning
             approximated_model.load_state_dict(best_checkpoint['model_state_dict'])
@@ -245,4 +248,4 @@ def qat_dse(adversarial_training: bool = False):
 
 
 if __name__ == "__main__":
-    qat_dse(adversarial_training=True)
+    qat_dse(adversarial_training=False)

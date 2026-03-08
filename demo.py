@@ -103,7 +103,7 @@ urllib3.disable_warnings(InsecureRequestWarning)
 XAI_SHAP_BASE_URL = "http://localhost:5000/xai/shap"
 
 # Simulation pacing: default to 0s (no artificial delay) so throughput reflects raw model speed.
-SIMULATION_INTERVAL_SECONDS = float(os.getenv('PRIVATEER_SIM_INTERVAL', '0.5'))
+SIMULATION_INTERVAL_SECONDS = float(os.getenv('PRIVATEER_SIM_INTERVAL', '0.01'))
 
 
 def _shap_iframe_src(view: str, serial: int) -> str:
@@ -791,21 +791,21 @@ class NetworkTrafficSimulator:
 
                 shap_payload = None
 
-                if is_anomaly:
-                    shap_payload = self._calculate_shap(sample[0]['encoder_cont'])
-                    info_misp = {
-                        'ip': ip,
-                        'time': result['timestamp']
-                    }
-                    print("Anomaly detected, info_misp:", info_misp)
-                    exported_anomalies.append(info_misp)
-                    self.misp_client.publish_anomaly(
-                        ip=ip,
-                        detection_time=result['timestamp'],
-                        device_id=device_id,
-                        reconstruction_error=score,
-                        threshold=self.detector.threshold
-                    )
+                # if is_anomaly:
+                #     shap_payload = self._calculate_shap(sample[0]['encoder_cont'])
+                #     info_misp = {
+                #         'ip': ip,
+                #         'time': result['timestamp']
+                #     }
+                #     print("Anomaly detected, info_misp:", info_misp)
+                #     exported_anomalies.append(info_misp)
+                #     self.misp_client.publish_anomaly(
+                #         ip=ip,
+                #         detection_time=result['timestamp'],
+                #         device_id=device_id,
+                #         reconstruction_error=score,
+                #         threshold=self.detector.threshold
+                #     )
 
                 if shap_payload:
                     result['shap'] = shap_payload
@@ -2351,4 +2351,4 @@ if __name__ == '__main__':
     logging.info("Open your browser and go to: http://127.0.0.1:8056")
     logging.info("=" * 50)
 
-    app.run(host='127.0.0.1', port=8056, debug=True)
+    app.run(host='0.0.0.0', port=8056, debug=True)
