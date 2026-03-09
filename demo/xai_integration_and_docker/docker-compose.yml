@@ -1,8 +1,6 @@
 services:
   xai-app:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: aimilefth/xai_integration_and_docker:latest
     ports:
       - "5000:5000"
     environment:

@@ -1,0 +1,1 @@
+docker build -t aimilefth/xai_integration_and_docker:latest --push .

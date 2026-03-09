@@ -7,7 +7,7 @@ import queue
 import logging
 import os
 import hashlib
-import sys
+import json
 from collections import deque
 from pathlib import Path
 
@@ -18,6 +18,7 @@ import dash_bootstrap_components as dbc
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import requests
 import torch
 from privateer_filter_inference.inference_dense import predict
@@ -27,7 +28,7 @@ import urllib3
 from dash import dcc, html, Input, Output, State
 
 from privateer_ad.architectures.transformer_ad import TransformerAD
-from privateer_ad.old_data_utils import OldDataProcessor
+from privateer_ad.etl import DataProcessor
 from privateer_ad.config import (
     DataConfig,
     MetadataConfig,
@@ -51,16 +52,17 @@ exported_anomalies = []
 
 SHAP_MAX_SEQ_LEN = int(os.getenv('SHAP_MAX_SEQ_LEN', '12'))
 
-DEFAULT_ANON_EPSILON = float(os.getenv('ANONYMIZER_EPSILON', '0.01'))
-ANONYMIZER_SENSITIVITY = float(os.getenv('ANONYMIZER_SENSITIVITY', '0.0'))
+DEFAULT_ANON_EPSILON = float(os.getenv('ANONYMIZER_EPSILON', '0.5'))
+ANONYMIZER_SENSITIVITY = float(os.getenv('ANONYMIZER_SENSITIVITY', '0.02'))
 EPSILON_MIN = float(os.getenv('ANONYMIZER_EPSILON_MIN', '0.01'))
 EPSILON_MAX = float(os.getenv('ANONYMIZER_EPSILON_MAX', '1.0'))
 EPSILON_STEP = float(os.getenv('ANONYMIZER_EPSILON_STEP', '0.01'))
 SENSITIVE_FEATURES = tuple(os.getenv('ANONYMIZER_SENSITIVE_FEATURES', 'dl_bitrate,ul_bitrate').split(','))
-# EXPERIMENT_MODEL_ID = os.getenv('PRIVATEER_EXPERIMENT_ID', 'experiments/20250313-181907')
-# This contains the model 
-# [adv_trained_model_on_anonymized_data.zip](https://spacecollab.sharepoint.com/:u:/r/sites/PRIVATEER/Shared%20Documents/WP3.%20Decentralised%20Robust%20Security%20Analytics/Anomaly%20Detection%20Model/adv_trained_model_on_anonymized_data.zip?csf=1&web=1&e=PwV1f7)
-EXPERIMENT_MODEL_ID = os.getenv('PRIVATEER_EXPERIMENT_ID', 'experiments/adv_anonymized_model/adv_trained_model_attack_eps_0.005.pt')
+EXPERIMENT_MODEL_ID = os.getenv('PRIVATEER_EXPERIMENT_ID', 'experiments/20250313-181907')
+DEFAULT_THRESHOLD = float(os.getenv('PRIVATEER_DEFAULT_THRESHOLD', '0.487431436777115'))
+DEFAULT_THRESHOLD_FPGA = float(os.getenv('PRIVATEER_DEFAULT_THRESHOLD_FPGA', '0.4874314069747925'))
+DEFAULT_THRESHOLD_CPU = float(os.getenv('PRIVATEER_DEFAULT_THRESHOLD_CPU', '0.48743143677711487'))
+THRESHOLD_CACHE_FILENAME = os.getenv('PRIVATEER_THRESHOLD_CACHE_FILE', 'demo_thresholds.json')
 
 def _env_as_bool(value: str | None, default: bool = False) -> bool:
     if value is None:
@@ -84,11 +86,10 @@ MISP_USERNAME = os.getenv('MISP_USERNAME') or "infili@misp.testing"
 MISP_PASSWORD = os.getenv('MISP_PASSWORD') or "]3L2>9bzS'RFM*Z"
 
 MLFLOW_RUN_ID = _env_as_str('PRIVATEER_MLFLOW_RUN_ID')
-MLFLOW_RUN_NAME = _env_as_str('PRIVATEER_MLFLOW_RUN_NAME', 'bright-chimp-326')
+MLFLOW_RUN_NAME = _env_as_str('PRIVATEER_MLFLOW_RUN_NAME')
 MLFLOW_ARTIFACT_PATH = _env_as_str('PRIVATEER_MLFLOW_ARTIFACT_PATH', 'TransformerAD')
-# I dont have val_inference.csv.
-INFERENCE_DATASET_FILENAME = os.getenv('PRIVATEER_INFERENCE_DATASET', 'test.csv')
-TUNING_DATASET_FILENAME = os.getenv('PRIVATEER_TUNING_DATASET', 'val.csv')
+INFERENCE_DATASET_FILENAME = os.getenv('PRIVATEER_INFERENCE_DATASET', 'val_inference.csv')
+TUNING_DATASET_FILENAME = os.getenv('PRIVATEER_TUNING_DATASET', 'val_inference.csv')
 RECOMPUTE_THRESHOLD = _env_as_bool(os.getenv('PRIVATEER_RECOMPUTE_THRESHOLD'), default=False)
 TARGET_FPR = float(os.getenv('PRIVATEER_TARGET_FPR', '0.01'))
 THRESHOLD_STRATEGY = os.getenv('PRIVATEER_THRESHOLD_STRATEGY', 'f1').strip().lower()
@@ -100,7 +101,8 @@ ALVEO_XCLBIN_PATH = os.getenv('PRIVATEER_ALVEO_XCLBIN_PATH', os.path.join('exper
 urllib3.disable_warnings(InsecureRequestWarning)
 
 
-XAI_SHAP_BASE_URL = "http://localhost:5000/xai/shap"
+XAI_BASE_URL = os.getenv('PRIVATEER_XAI_BASE_URL', 'http://127.0.0.1:5000').rstrip('/')
+XAI_SHAP_BASE_URL = f"{XAI_BASE_URL}/xai/shap"
 
 # Simulation pacing: default to 0s (no artificial delay) so throughput reflects raw model speed.
 SIMULATION_INTERVAL_SECONDS = float(os.getenv('PRIVATEER_SIM_INTERVAL', '0.01'))
@@ -336,6 +338,7 @@ class PrivateerAnomalyDetector:
         self.metadata = MetadataConfig()
         self.input_features = self.metadata.get_input_features()
         self.mlflow_config = MLFlowConfig()
+        self.mlflow_config.enabled = _env_as_bool(os.getenv('PRIVATEER_MLFLOW_ENABLED'), default=False)
         self.paths_config = PathConfig()
         self.inference_dataset_path = (self.paths_config.processed_dir / INFERENCE_DATASET_FILENAME).as_posix()
         self.tuning_dataset_path = (self.paths_config.processed_dir / TUNING_DATASET_FILENAME).as_posix()
@@ -346,25 +349,14 @@ class PrivateerAnomalyDetector:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Initialize DataProcessor with streaming config
-        # Initialize DataProcessor with streaming config
-        self.data_processor = OldDataProcessor(use_old_metadata=False)
-        self.test_ds = self.data_processor.get_dataset(
-            split=self.inference_dataset_path, 
-            seq_len=self.data_config.seq_len,
-            batch_size=self.data_config.batch_size,
-            only_benign=False,
-            num_workers=self.data_config.num_workers
-        )
+        self.data_processor = DataProcessor(self.data_config)
+        self.test_ds = self.data_processor.get_dataset(self.inference_dataset_path, only_benign=False)
         # Shuffle for demo to surface attacks quickly
-        self.test_dl = self.data_processor.get_dataloader(
-            split=self.inference_dataset_path, 
-            seq_len=self.data_config.seq_len,
-            batch_size=self.data_config.batch_size,
-            only_benign=False, 
-            shuffle=True,
-            num_workers=self.data_config.num_workers
-        )
-        self.threshold = 0.0209596287459135  # Default threshold
+        self.test_dl = self.data_processor.get_dataloader(self.inference_dataset_path, only_benign=False, train=True)
+        if self.device.type == 'cpu':
+            self.threshold = DEFAULT_THRESHOLD_CPU
+        else:
+            self.threshold = DEFAULT_THRESHOLD_FPGA
         self.loss_fn = None
         self.model = None
         self.hitl_enabled = False
@@ -382,16 +374,18 @@ class PrivateerAnomalyDetector:
 
     def _load_model_from_mlflow(self) -> bool:
         """Attempt to pull the model + metadata from MLflow."""
+        if not self.mlflow_config.enabled:
+            return False
+
         if not (self.mlflow_run_id or self.mlflow_run_name):
             return False
 
         tracking_candidates: list[str] = []
-        if self.mlflow_config.tracking_uri:
-            tracking_candidates.append(self.mlflow_config.tracking_uri)
-
         local_tracking = f"file://{PathConfig().root_dir / 'mlruns'}"
-        if local_tracking not in tracking_candidates:
-            tracking_candidates.append(local_tracking)
+        tracking_candidates.append(local_tracking)
+
+        if self.mlflow_config.tracking_uri and self.mlflow_config.tracking_uri not in tracking_candidates:
+            tracking_candidates.append(self.mlflow_config.tracking_uri)
 
         for tracking_uri in tracking_candidates:
             try:
@@ -429,30 +423,77 @@ class PrivateerAnomalyDetector:
     def _load_local_model(self) -> None:
         """Fallback to loading weights from the local experiments directory."""
         logging.info(f"Falling back to experiment artifacts at {self.experiment_id}...")
-        model_config = ModelConfig(
-            model_name=self.model_name,
-            input_size=len(self.input_features),
-            seq_len=SHAP_MAX_SEQ_LEN
-        )
         paths_config = PathConfig()
         state_dict = load_model_weights(self.experiment_id, paths_config)
+        model_config = self._infer_model_config_from_state_dict(state_dict)
         self.model = TransformerAD(model_config=model_config)
-        load_result = self.model.load_state_dict(state_dict, strict=False)
-        if isinstance(load_result, tuple):
-            missing_keys, unexpected_keys = load_result
-        else:
-            missing_keys = getattr(load_result, 'missing_keys', [])
-            unexpected_keys = getattr(load_result, 'unexpected_keys', [])
-        if missing_keys or unexpected_keys:
-            logging.warning(
-                "Model state dict mismatch; missing keys: %s, unexpected keys: %s",
-                missing_keys,
-                unexpected_keys
-            )
+        try:
+            self.model.load_state_dict(state_dict, strict=True)
+        except Exception as exc:
+            raise RuntimeError(
+                "Model checkpoint is incompatible with the current TransformerAD architecture. "
+                "Please use a checkpoint produced by this code version."
+            ) from exc
         self.model.to(self.device)
         self.model.eval()
         loss_fn_name = TrainingConfig().loss_fn_name
         self.loss_fn = getattr(torch.nn, loss_fn_name)(reduction='none')
+
+    def _infer_model_config_from_state_dict(self, state_dict: dict) -> ModelConfig:
+        """Infer transformer dimensions from checkpoint weights to prevent mismatch loads."""
+        default_cfg = ModelConfig(
+            model_name=self.model_name,
+            input_size=len(self.input_features),
+            seq_len=SHAP_MAX_SEQ_LEN
+        )
+
+        embed_weight = state_dict.get('embed.weight')
+        compress_weight = state_dict.get('compress.0.weight')
+
+        input_size = int(embed_weight.shape[1]) if embed_weight is not None else default_cfg.input_size
+        embed_dim = int(embed_weight.shape[0]) if embed_weight is not None else default_cfg.embed_dim
+        latent_dim = int(compress_weight.shape[0]) if compress_weight is not None else default_cfg.latent_dim
+
+        layer_ids = [
+            int(parts[2])
+            for key in state_dict.keys()
+            if key.startswith('transformer_encoder.layers.')
+            for parts in [key.split('.')]
+            if len(parts) > 2 and parts[2].isdigit()
+        ]
+        num_layers = max(layer_ids) + 1 if layer_ids else default_cfg.num_layers
+
+        num_heads = default_cfg.num_heads
+        if embed_dim % num_heads != 0:
+            compatible_heads = [h for h in (8, 4, 2, 1) if embed_dim % h == 0]
+            num_heads = compatible_heads[0] if compatible_heads else 1
+            logging.warning(
+                "Adjusted num_heads from %d to %d to match embed_dim=%d.",
+                default_cfg.num_heads,
+                num_heads,
+                embed_dim
+            )
+
+        inferred_cfg = ModelConfig(
+            model_name=self.model_name,
+            input_size=input_size,
+            num_layers=num_layers,
+            embed_dim=embed_dim,
+            latent_dim=latent_dim,
+            num_heads=num_heads,
+            seq_len=SHAP_MAX_SEQ_LEN,
+            dropout=default_cfg.dropout
+        )
+
+        logging.info(
+            "Inferred local model config from checkpoint: input_size=%d, embed_dim=%d, latent_dim=%d, num_layers=%d, num_heads=%d",
+            inferred_cfg.input_size,
+            inferred_cfg.embed_dim,
+            inferred_cfg.latent_dim,
+            inferred_cfg.num_layers,
+            inferred_cfg.num_heads
+        )
+        return inferred_cfg
 
     def detect_anomaly(self, input_batch):
         """
@@ -544,14 +585,7 @@ class PrivateerAnomalyDetector:
             logging.warning("Tuning dataset %s not found; falling back to inference dataset %s", tuning_path, self.inference_dataset_path)
             tuning_path = self.inference_dataset_path
 
-        eval_dl = self.data_processor.get_dataloader(
-            split=tuning_path, 
-            seq_len=self.data_config.seq_len,
-            batch_size=self.data_config.batch_size,
-            only_benign=False, 
-            shuffle=False,
-            num_workers=self.data_config.num_workers
-        )        
+        eval_dl = self.data_processor.get_dataloader(tuning_path, only_benign=False, train=False)
         errors: list[float] = []
         labels: list[int | None] = []
 
@@ -791,21 +825,21 @@ class NetworkTrafficSimulator:
 
                 shap_payload = None
 
-                # if is_anomaly:
-                #     shap_payload = self._calculate_shap(sample[0]['encoder_cont'])
-                #     info_misp = {
-                #         'ip': ip,
-                #         'time': result['timestamp']
-                #     }
-                #     print("Anomaly detected, info_misp:", info_misp)
-                #     exported_anomalies.append(info_misp)
-                #     self.misp_client.publish_anomaly(
-                #         ip=ip,
-                #         detection_time=result['timestamp'],
-                #         device_id=device_id,
-                #         reconstruction_error=score,
-                #         threshold=self.detector.threshold
-                #     )
+                if is_anomaly:
+                    shap_payload = self._calculate_shap(sample[0]['encoder_cont'])
+                    info_misp = {
+                        'ip': ip,
+                        'time': result['timestamp']
+                    }
+                    print("Anomaly detected, info_misp:", info_misp)
+                    exported_anomalies.append(info_misp)
+                    self.misp_client.publish_anomaly(
+                        ip=ip,
+                        detection_time=result['timestamp'],
+                        device_id=device_id,
+                        reconstruction_error=score,
+                        threshold=self.detector.threshold
+                    )
 
                 if shap_payload:
                     result['shap'] = shap_payload
@@ -857,7 +891,7 @@ class NetworkTrafficSimulator:
                 'dtype': str(tensor_cpu.dtype)
             }
             response = requests.post(
-                'http://localhost:5000/api/shap/calculate/string_json',
+                f'{XAI_BASE_URL}/api/shap/calculate/string_json',
                 json=payload,
                 timeout=10
             )
@@ -944,7 +978,6 @@ if USE_FPGA:
     alveo_runner = init_alveo_runner(xclbin_path=ALVEO_XCLBIN_PATH, device_num=0, seq_len=12, n_features=8)
 else:
     alveo_runner = None
-
 detector = PrivateerAnomalyDetector(runner=alveo_runner)
 anonymizer = DemoAnonymizer()
 simulator = NetworkTrafficSimulator(detector, anonymizer)
@@ -960,6 +993,85 @@ if torch.cuda.is_available() and detector.device.type != 'cpu':
     logging.info("Enabling dual-device simulation: gpu + cpu")
 else:
     logging.info("Running single-device simulation on %s", detector.device.type)
+
+
+def _threshold_cache_path() -> Path:
+    """Return the on-disk cache path for per-device demo thresholds."""
+    paths = PathConfig()
+    return paths.root_dir / EXPERIMENT_MODEL_ID / THRESHOLD_CACHE_FILENAME
+
+
+def _load_threshold_cache() -> dict[str, float]:
+    path = _threshold_cache_path()
+    if not path.exists():
+        return {}
+    try:
+        with path.open('r', encoding='utf-8') as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k): float(v) for k, v in raw.items()}
+    except Exception as exc:
+        logging.warning("Unable to read threshold cache at %s: %s", path, exc)
+        return {}
+
+
+def _save_threshold_cache(thresholds: dict[str, float]) -> None:
+    path = _threshold_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('w', encoding='utf-8') as f:
+            json.dump({k: float(v) for k, v in thresholds.items()}, f, indent=2, sort_keys=True)
+    except Exception as exc:
+        logging.warning("Unable to persist threshold cache at %s: %s", path, exc)
+
+
+def _initialize_device_thresholds() -> None:
+    """
+    Initialize per-device thresholds with this priority:
+    1) explicit env vars
+    2) cached per-device values
+    3) one-time recompute + cache
+    """
+    cache = _load_threshold_cache()
+    updated = False
+
+    for sim in simulators:
+        label = sim.device_label.lower()
+        explicit_env = (
+            os.getenv('PRIVATEER_DEFAULT_THRESHOLD_CPU')
+            if label == 'cpu'
+            else os.getenv('PRIVATEER_DEFAULT_THRESHOLD_FPGA')
+        )
+
+        if explicit_env is not None:
+            try:
+                sim.detector.threshold = float(explicit_env)
+                logging.info("Using explicit %s threshold from env: %.6f", label, sim.detector.threshold)
+                continue
+            except Exception as exc:
+                logging.warning("Invalid explicit %s threshold '%s': %s", label, explicit_env, exc)
+
+        if label in cache:
+            sim.detector.threshold = float(cache[label])
+            logging.info("Using cached %s threshold: %.6f", label, sim.detector.threshold)
+            continue
+
+        try:
+            computed = sim.detector.recompute_threshold(target_fpr=TARGET_FPR)
+            sim.detector.threshold = float(computed)
+            cache[label] = sim.detector.threshold
+            updated = True
+            logging.info("Computed %s threshold: %.6f", label, sim.detector.threshold)
+        except Exception as exc:
+            logging.warning("Unable to compute %s threshold; keeping %.6f (%s)",
+                            label, sim.detector.threshold, exc)
+
+    if updated:
+        _save_threshold_cache(cache)
+
+
+_initialize_device_thresholds()
 
 # Storage for real-time data
 realtime_data = {
@@ -989,9 +1101,33 @@ for feature in detector.input_features:
     realtime_data['raw_feature_values'][feature] = [] 
 
 max_points = 200  # Keep last 200 points for display
-min_threshold = float(np.floor(detector.threshold * .1))
-max_threshold = float(np.ceil(detector.threshold * 10.))
 step_threshold = 0.0001
+
+
+def _threshold_bounds(value: float) -> tuple[float, float]:
+    """Compute slider bounds for a given threshold."""
+    min_threshold = float(np.floor(value * 0.1))
+    max_threshold = float(np.ceil(value * 10.0))
+    if max_threshold <= min_threshold:
+        max_threshold = min_threshold + step_threshold
+    return min_threshold, max_threshold
+
+
+def _get_simulator_by_label(label: str) -> NetworkTrafficSimulator | None:
+    for sim in simulators:
+        if sim.device_label == label:
+            return sim
+    return None
+
+
+fpga_sim = _get_simulator_by_label('fpga')
+cpu_sim = _get_simulator_by_label('cpu')
+fpga_threshold = fpga_sim.detector.threshold if fpga_sim else detector.threshold
+cpu_threshold = cpu_sim.detector.threshold if cpu_sim else detector.threshold
+fpga_min_threshold, fpga_max_threshold = _threshold_bounds(fpga_threshold)
+cpu_min_threshold, cpu_max_threshold = _threshold_bounds(cpu_threshold)
+has_fpga = fpga_sim is not None
+has_cpu = cpu_sim is not None
 
 
 def _empty_hitl_store():
@@ -1183,17 +1319,35 @@ app.layout = dbc.Container([
                     ]),
                     html.Hr(),
                     html.Div([
-                        html.Label("🎯 Anomaly Threshold:", className="form-label"),
+                        html.Label("🎯 Anomaly Threshold (FPGA):", className="form-label"),
                         dcc.Slider(
-                            id='threshold-slider',
-                            min=min_threshold,
-                            max=max_threshold,
+                            id='threshold-slider-fpga',
+                            min=fpga_min_threshold,
+                            max=fpga_max_threshold,
                             step=step_threshold,
-                            value=detector.threshold,
+                            value=fpga_threshold,
                             marks={
                                 value: f"{value:.3f}"
-                                for value in np.linspace(min_threshold, max_threshold, 10)
-                            },                            tooltip={"placement": "bottom", "always_visible": True}
+                                for value in np.linspace(fpga_min_threshold, fpga_max_threshold, 10)
+                            },
+                            tooltip={"placement": "bottom", "always_visible": True},
+                            disabled=not has_fpga
+                        )
+                    ], className="mb-3"),
+                    html.Div([
+                        html.Label("🎯 Anomaly Threshold (CPU):", className="form-label"),
+                        dcc.Slider(
+                            id='threshold-slider-cpu',
+                            min=cpu_min_threshold,
+                            max=cpu_max_threshold,
+                            step=step_threshold,
+                            value=cpu_threshold,
+                            marks={
+                                value: f"{value:.3f}"
+                                for value in np.linspace(cpu_min_threshold, cpu_max_threshold, 10)
+                            },
+                            tooltip={"placement": "bottom", "always_visible": True},
+                            disabled=not has_cpu
                         )
                     ], className="mb-3"),
                     html.Div([
@@ -1223,33 +1377,35 @@ app.layout = dbc.Container([
         ], width=12)
     ], className="mb-4"),
 
-dbc.Row([
+    dbc.Row([
         dbc.Col([
             dbc.Card([
                 dbc.CardBody([
                     html.H4("📊 Network Feature Values (Privacy-Preserved)", className="card-title"),
-                    # Changed height to 850px to cover the two stacked graphs on the right
-                    dcc.Graph(id="feature-display", style={'height': '850px'})
+                    dcc.Graph(id="feature-display", style={'height': '420px'})
                 ])
             ])
         ], width=6),
 
         dbc.Col([
-            # CPU Detection
             dbc.Card([
                 dbc.CardBody([
-                    html.H4("🚨 Anomaly Detection Results (CPU)", className="card-title"),
-                    dcc.Graph(id="anomaly-detection-cpu", style={'height': '400px'})
-                ])
-            ], className="mb-4"),
-            # FPGA Detection (Stacked below CPU)
-            dbc.Card([
-                dbc.CardBody([
-                    html.H4("🚨 Anomaly Detection Results (FPGA)", className="card-title"),
-                    dcc.Graph(id="anomaly-detection-fpga", style={'height': '400px'})
+                    html.H4("📏 Per-sample Absolute Difference", className="card-title"),
+                    dcc.Graph(id="difference-graph", style={'height': '420px'})
                 ])
             ])
         ], width=6)
+    ], className="mb-4"),
+
+    dbc.Row([
+        dbc.Col([
+            dbc.Card([
+                dbc.CardBody([
+                    html.H4("🚨 Anomaly Detection Results", className="card-title"),
+                    dcc.Graph(id="anomaly-detection", style={'height': '450px'})
+                ])
+            ])
+        ], width=12)
     ], className="mb-4"),
 
     dbc.Row([
@@ -1301,7 +1457,6 @@ dbc.Row([
     ], className="mb-4"),
 
     dbc.Row([
-        # Width changed from 6 to 4
         dbc.Col([
                     dbc.Card([
                         dbc.CardBody([
@@ -1319,34 +1474,15 @@ dbc.Row([
                             ),
                             dcc.Graph(
                                 id="latency-graph",
-                                style={'height': '520px', 'width': '100%', 'margin': '0 auto'}
+                                style={'height': '520px', 'width': '520px', 'margin': '0 auto'}
                             )
                         ])
             ])
-        ], width=4),
-        
-        # NEW COLUMN for Absolute Difference
+        ], width=6),
         dbc.Col([
             dbc.Card([
                 dbc.CardBody([
-                    html.H4("🔍 Reconstruction Error Difference", className="card-title"),
-                    html.Small(
-                        "Absolute difference between CPU and FPGA reconstruction errors.",
-                        className="text-muted d-block mb-3"
-                    ),
-                    dcc.Graph(
-                        id="diff-graph",
-                        style={'height': '520px', 'width': '100%', 'margin': '0 auto'}
-                    )
-                ])
-            ])
-        ], width=4),
-
-        # Width changed from 6 to 4
-        dbc.Col([
-            dbc.Card([
-                dbc.CardBody([
-                    html.H4("📊 Feature Influence SHAP", className="card-title"),
+                    html.H4("📊 Feature Influence SHAP (Last anomaly detected)", className="card-title"),
                     html.Div(
                         id="shap-timeseries-container",
                         children=_shap_placeholder(),
@@ -1354,7 +1490,7 @@ dbc.Row([
                     )
                 ])
             ])
-        ], width=4)
+        ], width=6)
     ], className="mb-4", justify="center"),
 
     dbc.Row([
@@ -1407,13 +1543,25 @@ dbc.Row([
 # Callbacks
 @app.callback(
     Output('simulation-state', 'data', allow_duplicate=True),
-    Input('threshold-slider', 'value'),
+    Input('threshold-slider-fpga', 'value'),
     prevent_initial_call=True
 )
-def update_threshold(threshold):
-    """Callback to handle threshold slider changes in real-time."""
-    for sim in simulators:
-        sim.detector.update_threshold(threshold)
+def update_threshold_fpga(threshold):
+    """Update threshold for the FPGA simulator only."""
+    if fpga_sim:
+        fpga_sim.detector.update_threshold(threshold)
+    return dash.no_update
+
+
+@app.callback(
+    Output('simulation-state', 'data', allow_duplicate=True),
+    Input('threshold-slider-cpu', 'value'),
+    prevent_initial_call=True
+)
+def update_threshold_cpu(threshold):
+    """Update threshold for the CPU simulator only."""
+    if cpu_sim:
+        cpu_sim.detector.update_threshold(threshold)
     return dash.no_update
 
 
@@ -1549,9 +1697,8 @@ def control_simulation(start_clicks, stop_clicks, reset_clicks, state):
 
 @app.callback(
     [Output('feature-display', 'figure'),
-     Output('anomaly-detection-cpu', 'figure'),   # Renamed from anomaly-detection
-     Output('anomaly-detection-fpga', 'figure'),  # NEW
-     Output('diff-graph', 'figure'),              # NEW
+     Output('difference-graph', 'figure'),
+     Output('anomaly-detection', 'figure'),
      Output('fpr-trend', 'figure'),
      Output('stats-display', 'children'),
      Output('device-list', 'children'),
@@ -1564,7 +1711,6 @@ def update_graphs(n, throughput_window, state):
     """Main callback for updating all dashboard visualizations."""
     if not state.get('running', False):
         return (
-            create_empty_figure("Simulation Stopped"),
             create_empty_figure("Simulation Stopped"),
             create_empty_figure("Simulation Stopped"),
             create_empty_figure("Simulation Stopped"),
@@ -1636,12 +1782,8 @@ def update_graphs(n, throughput_window, state):
                 realtime_data[key] = realtime_data[key][-max_points:]
 
     feature_fig = create_feature_figure()
-    # Create two separate anomaly figures
-    anomaly_fig_cpu = create_anomaly_figure(source='cpu')
-    anomaly_fig_fpga = create_anomaly_figure(source='alveo')
-    # Create the difference figure
-    diff_fig = create_diff_figure()
-
+    diff_fig = create_difference_figure()
+    anomaly_fig = create_anomaly_figure()
     fpr_fig = create_fpr_figure()
     stats = create_statistics()
     device_list = create_device_list()
@@ -1649,14 +1791,14 @@ def update_graphs(n, throughput_window, state):
 
     return (
         feature_fig,
-        anomaly_fig_cpu,
-        anomaly_fig_fpga,
         diff_fig,
+        anomaly_fig,
         fpr_fig,
         stats,
         device_list,
         latency_fig
     )
+
 
 @app.callback(
     Output('hitl-panel', 'children'),
@@ -1802,7 +1944,11 @@ def update_xai_sections(n, state):
 
     if not shap_payload:
         last_xai_anomaly_timestamp = None
-        return _shap_placeholder(), _shap_placeholder(), _shap_placeholder()
+        return (
+            _shap_placeholder(f"SHAP unavailable at {XAI_BASE_URL}"),
+            _shap_placeholder(f"SHAP unavailable at {XAI_BASE_URL}"),
+            _shap_placeholder(f"SHAP unavailable at {XAI_BASE_URL}")
+        )
 
     if last_xai_anomaly_timestamp != anomaly_timestamp:
         iframe_refresh_serial += 1
@@ -1897,7 +2043,7 @@ def create_throughput_figure(window_seconds):
 
 
 def create_latency_figure(window_seconds):
-    """Show average inference latency (ms) comparison: CPU vs FPGA."""
+    """Show average inference latency (ms) per device within the aggregation window."""
     if not realtime_data['timestamp']:
         return create_empty_figure("No Data Available")
 
@@ -1912,43 +2058,36 @@ def create_latency_figure(window_seconds):
     cutoff = latest_ts - timedelta(seconds=window_seconds)
 
     cpu_latencies = []
-    alveo_latencies = []
+    fpga_latencies =[]
 
-    # Iterate backwards or zip through lists
-    # Assuming lists are synchronized by index
     for i, ts in enumerate(realtime_data['timestamp']):
         if ts < cutoff:
             continue
         
-        # Host latency
-        if realtime_data['latency_ms'][i] is not None:
-            cpu_latencies.append(realtime_data['latency_ms'][i])
-        
-        # Alveo latency
-        if realtime_data['latency_ms_alveo'][i] is not None:
-            alveo_latencies.append(realtime_data['latency_ms_alveo'][i])
+        lat_cpu = realtime_data['latency_ms'][i]
+        if lat_cpu is not None:
+            cpu_latencies.append(lat_cpu)
+            
+        lat_alveo = realtime_data['latency_ms_alveo'][i]
+        if lat_alveo is not None:
+            fpga_latencies.append(lat_alveo)
 
-    if not cpu_latencies and not alveo_latencies:
+    if not cpu_latencies and not fpga_latencies:
         return create_empty_figure("No Data Available")
 
-    averages = {}
+    avg_latency = {}
     if cpu_latencies:
-        averages['CPU'] = sum(cpu_latencies) / len(cpu_latencies)
-    if alveo_latencies:
-        averages['FPGA'] = sum(alveo_latencies) / len(alveo_latencies)
+        avg_latency['CPU'] = sum(cpu_latencies) / len(cpu_latencies)
+    if fpga_latencies:
+        avg_latency['FPGA'] = sum(fpga_latencies) / len(fpga_latencies)
 
     fig = go.Figure()
-    labels = list(averages.keys())
-    values = list(averages.values())
-    
-    # Colors: Host = Blueish, Alveo = Orange/Reddish
-    colors = ['#7480ff' if 'CPU' in lbl else '#ff8b73' for lbl in labels]
-
+    labels = sorted(avg_latency.keys())
     fig.add_trace(go.Bar(
         x=labels,
-        y=values,
-        marker=dict(color=colors),
-        text=[f"{v:.2f} ms" for v in values],
+        y=[avg_latency[lbl] for lbl in labels],
+        marker=dict(color=['#7480ff' if lbl == 'CPU' else '#ff8b73' for lbl in labels]),
+        text=[f"{v:.2f} ms" for v in [avg_latency[lbl] for lbl in labels]],
         textposition='auto'
     ))
 
@@ -2103,109 +2242,15 @@ def create_feature_figure():
     return fig
 
 
-def create_anomaly_figure(source='cpu'):
-    """
-    Create reconstruction error plot.
-    source: 'cpu' or 'alveo'
-    """
-    if not realtime_data['timestamp']:
-        return create_empty_figure("No Data Available")
-
-    idx_sorted = sorted(range(len(realtime_data['timestamp'])), key=lambda i: realtime_data['timestamp'][i])
-    timestamps = [realtime_data['timestamp'][i] for i in idx_sorted]
-
-    # Select data based on source
-    if source == 'alveo':
-        # Check if Alveo data exists (not None)
-        valid_data = [x for x in realtime_data['score_alveo'] if x is not None]
-        if not valid_data:
-            return create_empty_figure("FPGA is not initialized")
-            
-        errors = [realtime_data['score_alveo'][i] for i in idx_sorted]
-        is_anomaly_flags = [realtime_data['is_anomaly_alveo'][i] for i in idx_sorted]
-        # Use alveo specific labels if available, else fallback to common
-        true_labels = [realtime_data['true_label_alveo'][i] if realtime_data['true_label_alveo'][i] is not None 
-                       else realtime_data['true_label'][i] for i in idx_sorted]
-        title_suffix = "(FPGA)"
-    else:
-        errors = [realtime_data['reconstruction_error'][i] for i in idx_sorted]
-        is_anomaly_flags = [realtime_data['is_anomaly'][i] for i in idx_sorted]
-        true_labels = [realtime_data['true_label'][i] for i in idx_sorted]
-        title_suffix = "(CPU)"
-
-    # Handle case where filtered data might be None in the list (if mixed)
-    # Replace None with 0.0 or skip for plotting safety
-    clean_errors = []
-    clean_timestamps = []
-    clean_flags = []
-    clean_labels = []
-    
-    for t, e, f, l in zip(timestamps, errors, is_anomaly_flags, true_labels):
-        if e is not None:
-            clean_timestamps.append(t)
-            clean_errors.append(e)
-            clean_flags.append(f)
-            clean_labels.append(l)
-
-    if not clean_timestamps:
-        return create_empty_figure(f"No {source.upper()} Data")
-
-    fig = go.Figure()
-
-    colors = ['red' if anomaly else 'blue' for anomaly in clean_flags]
-
-    fig.add_trace(go.Scatter(
-        x=clean_timestamps,
-        y=clean_errors,
-        mode='markers+lines',
-        name='Reconstruction Error',
-        marker=dict(color=colors, size=6),
-        line=dict(color='gray', width=1)
-    ))
-
-    # Add threshold line
-    fig.add_hline(
-        y=detector.threshold,
-        line_dash="dash",
-        line_color="red",
-        annotation_text=f"Threshold ({detector.threshold:.6f})"
-    )
-
-    # Add ground truth markers
-    true_anomaly_times = [clean_timestamps[i] for i, label in enumerate(clean_labels) if label == 1]
-    true_anomaly_scores = [clean_errors[i] for i, label in enumerate(clean_labels) if label == 1]
-
-    if true_anomaly_times:
-        fig.add_trace(go.Scatter(
-            x=true_anomaly_times,
-            y=true_anomaly_scores,
-            mode='markers',
-            name='True Attacks',
-            marker=dict(color='orange', size=8, symbol='diamond'),
-            showlegend=True
-        ))
-
-    fig.update_layout(
-        title=f"Reconstruction Error {title_suffix}",
-        xaxis_title="Time",
-        yaxis_title="L1 Loss",
-        hovermode='x unified',
-        margin=dict(t=40, b=20)
-    )
-
-    return fig
-
-
-def create_diff_figure():
-    """Create a plot showing absolute difference between CPU and Alveo scores."""
+def create_difference_figure():
+    """Plot |FPGA - CPU| reconstruction error per aligned sample index."""
     if not realtime_data['timestamp']:
         return create_empty_figure("No Data Available")
 
     idx_sorted = sorted(range(len(realtime_data['timestamp'])), key=lambda i: realtime_data['timestamp'][i])
     
     diffs = []
-    timestamps = []
-    
+    sample_indices =[]
     has_valid_alveo = False
 
     for i in idx_sorted:
@@ -2215,30 +2260,152 @@ def create_diff_figure():
         if cpu_score is not None and alveo_score is not None:
             has_valid_alveo = True
             diffs.append(abs(cpu_score - alveo_score))
-            timestamps.append(realtime_data['timestamp'][i])
+            sample_indices.append(realtime_data['sample_index'][i])
     
     if not has_valid_alveo:
-        return create_empty_figure("FPGA is not initialized")
+        return create_empty_figure("Waiting for both FPGA and CPU samples")
 
     fig = go.Figure()
-    
     fig.add_trace(go.Scatter(
-        x=timestamps,
+        x=sample_indices,
         y=diffs,
-        mode='markers+lines',
-        name='Abs Diff',
-        line=dict(color='#fd7e14', width=2),
-        marker=dict(size=4)
+        mode='lines',
+        name='|FPGA - CPU|',
+        line=dict(color='#1f4b99', width=1.8),
+        hovertemplate="Sample %{x}<br>|Δ|=%{y:.6f}<extra></extra>"
     ))
-    
+
     fig.update_layout(
-        title="Reconstruction Error Difference (CPU vs FPGA)",
-        xaxis_title="Time",
-        yaxis_title="|CPU - FPGA|",
-        hovermode='x unified',
-        margin=dict(t=40, b=20)
+        title="Per-sample |anomaly score| difference",
+        xaxis_title="sample index",
+        yaxis_title="|score_fpga - score_cpu|",
+        hovermode='x',
+        margin=dict(t=60, l=70, r=20, b=60),
+        plot_bgcolor="white"
     )
+    fig.update_xaxes(showgrid=True, gridcolor="#e5e5e5", zeroline=False)
+    fig.update_yaxes(showgrid=True, gridcolor="#e5e5e5", zeroline=False)
+    return fig
+
+
+def create_anomaly_figure():
+    """Create reconstruction error plot with threshold and ground truth markers."""
+    if not realtime_data['timestamp']:
+        return create_empty_figure("No Data Available")
+
+    idx_sorted = sorted(range(len(realtime_data['timestamp'])), key=lambda i: realtime_data['timestamp'][i])
     
+    device_specs = [
+        ('fpga', 'FPGA'),
+        ('cpu', 'CPU')
+    ]
+
+    fig = make_subplots(
+        rows=1,
+        cols=len(device_specs),
+        shared_yaxes=True,
+        subplot_titles=[title for _, title in device_specs]
+    )
+
+    for col, (device_key, device_title) in enumerate(device_specs, start=1):
+        axis_suffix = '' if col == 1 else col
+        
+        # Identify elements with data depending on target runtime device
+        valid_idxs =[]
+        for i in idx_sorted:
+            if device_key == 'fpga' and realtime_data['score_alveo'][i] is not None:
+                valid_idxs.append(i)
+            elif device_key == 'cpu' and realtime_data['reconstruction_error'][i] is not None:
+                valid_idxs.append(i)
+
+        if not valid_idxs:
+            fig.add_annotation(
+                text=f"No {device_title} data yet",
+                xref=f"x{axis_suffix} domain",
+                yref=f"y{axis_suffix} domain",
+                x=0.5,
+                y=0.5,
+                showarrow=False,
+                font=dict(color="gray", size=12),
+                row=1,
+                col=col
+            )
+            continue
+
+        timestamps =[realtime_data['timestamp'][i] for i in valid_idxs]
+        
+        if device_key == 'fpga':
+            errors = [realtime_data['score_alveo'][i] for i in valid_idxs]
+            is_anomalies = [realtime_data['is_anomaly_alveo'][i] for i in valid_idxs]
+            true_labels = [realtime_data['true_label_alveo'][i] if realtime_data['true_label_alveo'][i] is not None else realtime_data['true_label'][i] for i in valid_idxs]
+        else:
+            errors = [realtime_data['reconstruction_error'][i] for i in valid_idxs]
+            is_anomalies = [realtime_data['is_anomaly'][i] for i in valid_idxs]
+            true_labels = [realtime_data['true_label'][i] for i in valid_idxs]
+
+        fig.add_trace(go.Scatter(
+            x=timestamps,
+            y=errors,
+            mode='markers+lines',
+            name='Reconstruction Error',
+            marker=dict(color='blue', size=6),
+            line=dict(color='gray', width=1),
+            legendgroup='recon',
+            showlegend=(col == 1)
+        ), row=1, col=col)
+
+        anomaly_times = [timestamps[idx] for idx, is_anom in enumerate(is_anomalies) if is_anom]
+        anomaly_scores = [errors[idx] for idx, is_anom in enumerate(is_anomalies) if is_anom]
+        
+        if anomaly_times:
+            fig.add_trace(go.Scatter(
+                x=anomaly_times,
+                y=anomaly_scores,
+                mode='markers',
+                name='Detected Anomalies',
+                marker=dict(color='red', size=8, symbol='x'),
+                showlegend=False,
+                hoverinfo='x+y+name'
+            ), row=1, col=col)
+
+        sim = _get_simulator_by_label(device_key)
+        threshold = sim.detector.threshold if sim else detector.threshold
+
+        fig.add_hline(
+            y=threshold,
+            line_dash="dash",
+            line_color="red",
+            annotation_text=f"Threshold ({threshold:.6f})",
+            annotation_position="top right",
+            row=1,
+            col=col
+        )
+
+        true_anomaly_times = [timestamps[idx] for idx, label in enumerate(true_labels) if label == 1]
+        true_anomaly_scores = [errors[idx] for idx, label in enumerate(true_labels) if label == 1]
+
+        if true_anomaly_times:
+            fig.add_trace(go.Scatter(
+                x=true_anomaly_times,
+                y=true_anomaly_scores,
+                mode='markers',
+                name='True Attacks',
+                marker=dict(color='gold', size=8, symbol='diamond'),
+                legendgroup='true_attacks',
+                showlegend=(col == 1)
+            ), row=1, col=col)
+
+        fig.update_xaxes(title_text="Time", row=1, col=col)
+
+    fig.update_yaxes(title_text="Reconstruction Error (L1 Loss)", row=1, col=1)
+
+    fig.update_layout(
+        title="TransformerAD Anomaly Detection — FPGA vs CPU",
+        hovermode='x unified',
+        showlegend=True,
+        margin=dict(t=60, b=40)
+    )
+
     return fig
 
 
@@ -2351,4 +2518,4 @@ if __name__ == '__main__':
     logging.info("Open your browser and go to: http://127.0.0.1:8056")
     logging.info("=" * 50)
 
-    app.run(host='0.0.0.0', port=8056, debug=True)
+    app.run(host='127.0.0.1', port=8056, debug=True)
