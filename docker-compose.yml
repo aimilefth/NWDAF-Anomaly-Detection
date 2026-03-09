@@ -75,3 +75,17 @@ services:
       memlock: -1
       stack: 67108864
     cpus: "20"   # half of 40
+
+  caddy:
+    image: caddy:2
+    container_name: privateer-caddy
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

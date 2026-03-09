@@ -10,7 +10,6 @@ import hashlib
 import json
 from collections import deque
 from pathlib import Path
-
 from datetime import datetime, timedelta
 
 import dash
@@ -102,14 +101,16 @@ urllib3.disable_warnings(InsecureRequestWarning)
 
 
 XAI_BASE_URL = os.getenv('PRIVATEER_XAI_BASE_URL', 'http://127.0.0.1:5000').rstrip('/')
-XAI_SHAP_BASE_URL = f"{XAI_BASE_URL}/xai/shap"
+
+# Public/browser-facing base used only by the iframe src.
+# This should be same-origin with the dashboard and proxied by Caddy.
+XAI_SHAP_PUBLIC_BASE = os.getenv('PRIVATEER_XAI_SHAP_PUBLIC_BASE', '/xai/shap').rstrip('/')
+
 
 # Simulation pacing: default to 0s (no artificial delay) so throughput reflects raw model speed.
 SIMULATION_INTERVAL_SECONDS = float(os.getenv('PRIVATEER_SIM_INTERVAL', '0.01'))
-
-
 def _shap_iframe_src(view: str, serial: int) -> str:
-    return f"{XAI_SHAP_BASE_URL}/{view}?refresh={serial}"
+    return f"{XAI_SHAP_PUBLIC_BASE}/{view}?refresh={serial}"
 
 SHAP_IFRAME_STYLE = {
     "width": "1400px",

@@ -77,7 +77,7 @@ if [[ "$ALVEO" == "true" ]]; then
   fi
 fi
 
-SERVICES=("mlflow")
+SERVICES=("mlflow" "caddy")
 if [[ "$ALVEO" == "true" ]]; then
   SERVICES+=("app-fpga")
 else
