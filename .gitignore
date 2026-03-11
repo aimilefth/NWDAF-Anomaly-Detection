@@ -168,3 +168,12 @@ data/processed/*.csv
 
 __marimo__
 *.xclbin
+mlflow_logs
+experiments/TransformerAD_DP_v15
+app
+experiments/dse_visualizations
+experiments/Federated_Learning_Model
+*.txt
+*.png
+*.pt
+mlruns

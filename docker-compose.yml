@@ -75,3 +75,20 @@ services:
       memlock: -1
       stack: 67108864
     cpus: "20"   # half of 40
+
+  xai-app:
+    image: aimilefth/xai_integration_and_docker:latest
+    network_mode: host
+    environment:
+      - FLASK_ENV=production
+      - PYTHONPATH=/app
+    volumes:
+      - ./demo/xai_integration_and_docker/backend/models:/app/backend/models
+      - ./demo/xai_integration_and_docker/backend/datasets:/app/backend/datasets
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/swagger.json"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
