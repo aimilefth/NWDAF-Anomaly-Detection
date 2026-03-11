@@ -1,0 +1,9 @@
+http://147.102.37.230:8057 {
+    basic_auth {
+        admin $2a$14$W.eAWyD2E8IhtswfW2iSAO8C0puqk40btKIrCWjf73WTqzg6rZjbS
+    }
+
+    route {
+        reverse_proxy 127.0.0.1:8056
+    }
+}
