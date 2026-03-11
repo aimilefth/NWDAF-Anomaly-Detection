@@ -37,7 +37,8 @@ def load_model(model_dir):
         latent_dim=config["latent_dim"]
     )
     
-    model.load_state_dict(torch.load(model_path))
+    # Explicitly map the loaded weights to CPU
+    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
     model.eval()
     return model, config
 

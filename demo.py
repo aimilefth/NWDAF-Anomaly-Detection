@@ -78,7 +78,7 @@ def _env_as_str(name: str, default: str | None = None) -> str | None:
         return None
     return value
 
-MISP_BASE_URL = os.getenv('MISP_URL') or "https://10.160.3.60"
+MISP_BASE_URL = os.getenv('MISP_BASE_URL') or "https://10.160.3.60"
 MISP_API_KEY = os.getenv('MISP_API_KEY') or "QJVfx7A4SwMY7UsgNtzNE47Qtv5D4Qf0cBAPSCdr"
 MISP_VERIFY_SSL = _env_as_bool(os.getenv('MISP_VERIFY_SSL'), default=False)
 MISP_TIMEOUT = float(os.getenv('MISP_TIMEOUT', '5.0'))
@@ -874,6 +874,12 @@ class NetworkTrafficSimulator:
     def _calculate_shap(self, tensor: torch.Tensor):
         """Call XAI backend to obtain SHAP values for the provided tensor."""
         try:
+            # SHAP endpoint expects a single time-series instance. Dataloader batches
+            # can contain multiple instances, so keep only one sample.
+            if tensor.ndim == 2:
+                tensor = tensor.unsqueeze(0)
+            elif tensor.ndim == 3 and tensor.shape[0] > 1:
+                tensor = tensor[:1]
             model_cfg = getattr(self.detector.model, 'model_config', None)
             shap_seq_len = None
             if model_cfg is not None:
